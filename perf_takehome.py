@@ -38,17 +38,20 @@ from problem import (
 
 
 class KernelBuilder:
-    def __init__(self):
+    def __init__(self, enable_debug: bool = False):
         self.instrs = []
         self.scratch = {}
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
+        self.enable_debug = enable_debug
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
+        if not self.enable_debug:
+            slots = [slot for slot in slots if slot[0] != "debug"]
         if not vliw:
             # Simple slot packing that just uses one slot per instruction bundle
             instrs = []
@@ -73,6 +76,13 @@ class KernelBuilder:
                     for i in range(VLEN):
                         writes.add(dest + i)
                     reads.add(src)
+                elif slot[0] == "multiply_add":
+                    _, dest, a1, a2, a3 = slot
+                    for i in range(VLEN):
+                        writes.add(dest + i)
+                        reads.add(a1 + i)
+                        reads.add(a2 + i)
+                        reads.add(a3 + i)
                 else:
                     op, dest, a1, a2 = slot[:4]
                     for i in range(VLEN):
@@ -167,6 +177,8 @@ class KernelBuilder:
         return instrs
 
     def add(self, engine, slot):
+        if engine == "debug" and not self.enable_debug:
+            return
         self.instrs.append({engine: [slot]})
 
     def alloc_scratch(self, name=None, length=1):
@@ -262,7 +274,6 @@ class KernelBuilder:
             self.add("load", ("const", tmp1, i))
             self.add("load", ("load", self.scratch[v], tmp1))
 
-        zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
 
@@ -282,10 +293,11 @@ class KernelBuilder:
         v_val_B = self.alloc_scratch("v_val_B", VLEN)
         v_node_val_B = self.alloc_scratch("v_node_val_B", VLEN)
         
-        # Shared temporaries (can be reused since hash is sequential per batch)
+        # Shared temporaries (v_tmp4 used to keep A/B hash temps independent)
         v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
         v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
         v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
+        v_tmp4 = self.alloc_scratch("v_tmp4", VLEN)
 
         # Scalar temps for address computation - need two for parallel loads
         base_addr_A = self.alloc_scratch("base_addr_A")
@@ -294,12 +306,10 @@ class KernelBuilder:
         node_addr_tmp2 = self.alloc_scratch("node_addr_tmp2")
 
         # Broadcast constants to vectors
-        v_zero = self.alloc_scratch("v_zero", VLEN)
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
 
-        body.append(("valu", ("vbroadcast", v_zero, zero_const)))
         body.append(("valu", ("vbroadcast", v_one, one_const)))
         body.append(("valu", ("vbroadcast", v_two, two_const)))
         body.append(("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"])))
@@ -349,23 +359,19 @@ class KernelBuilder:
             slots.append(("valu", ("^", v_val, v_val, v_node_val)))
             # Hash
             slots.extend(self.build_hash_vectorized_pipelined(v_val, v_tmp1, v_tmp2, v_hash_consts, round, offset))
-            # v_tmp1 = v_val % 2
-            slots.append(("valu", ("%", v_tmp1, v_val, v_two)))
-            # v_tmp1 = (v_tmp1 == 0)
-            slots.append(("valu", ("==", v_tmp1, v_tmp1, v_zero)))
-            # v_tmp3 = select(v_tmp1, 1, 2)
-            slots.append(("flow", ("vselect", v_tmp3, v_tmp1, v_one, v_two)))
-            # v_idx = v_idx * 2
-            slots.append(("valu", ("*", v_idx, v_idx, v_two)))
-            # v_idx = v_idx + v_tmp3
-            slots.append(("valu", ("+", v_idx, v_idx, v_tmp3)))
+            # v_tmp1 = v_val & 1
+            slots.append(("valu", ("&", v_tmp1, v_val, v_one)))
+            # v_tmp3 = v_tmp1 + 1 (1 if even, 2 if odd)
+            slots.append(("valu", ("+", v_tmp3, v_tmp1, v_one)))
+            # v_idx = v_idx * 2 + v_tmp3
+            slots.append(("valu", ("multiply_add", v_idx, v_idx, v_two, v_tmp3)))
             # Debug for next_idx BEFORE the wrap
             for lane in range(VLEN):
                 slots.append(("debug", ("compare", v_idx + lane, (round, offset + lane, "next_idx"))))
             # v_tmp1 = (v_idx < n_nodes)
             slots.append(("valu", ("<", v_tmp1, v_idx, v_n_nodes)))
-            # v_idx = select(v_tmp1, v_idx, 0)
-            slots.append(("flow", ("vselect", v_idx, v_tmp1, v_idx, v_zero)))
+            # v_idx = v_idx * v_tmp1 (zero if out of range)
+            slots.append(("valu", ("*", v_idx, v_idx, v_tmp1)))
             # Debug for wrapped_idx AFTER the wrap
             for lane in range(VLEN):
                 slots.append(("debug", ("compare", v_idx + lane, (round, offset + lane, "wrapped_idx"))))
@@ -463,13 +469,11 @@ class KernelBuilder:
                         # First two ops for both batches (independent, can pack)
                         body.append(("valu", (op1, v_tmp1, v_val_A, v_val1)))
                         body.append(("valu", (op3, v_tmp2, v_val_A, v_val3)))
-                        body.append(("valu", (op1, v_tmp3, v_val_B, v_val1)))  # Use v_tmp3 for B's first op
-                        # Third op for A (depends on A's first two)
+                        body.append(("valu", (op1, v_tmp3, v_val_B, v_val1)))
+                        body.append(("valu", (op3, v_tmp4, v_val_B, v_val3)))
+                        # Third op for both batches
                         body.append(("valu", (op2, v_val_A, v_tmp1, v_tmp2)))
-                        # Second batch's second op (can now reuse v_tmp2)
-                        body.append(("valu", (op3, v_tmp2, v_val_B, v_val3)))
-                        # Third op for B
-                        body.append(("valu", (op2, v_val_B, v_tmp3, v_tmp2)))
+                        body.append(("valu", (op2, v_val_B, v_tmp3, v_tmp4)))
                         
                         # Debug for both batches
                         for lane in range(VLEN):
@@ -477,28 +481,24 @@ class KernelBuilder:
                             body.append(("debug", ("compare", v_val_B + lane, (round, offset_B + lane, "hash_stage", hi))))
                     
                     # Index computation - batch A
-                    body.append(("valu", ("%", v_tmp1, v_val_A, v_two)))
-                    body.append(("valu", ("==", v_tmp1, v_tmp1, v_zero)))
-                    body.append(("flow", ("vselect", v_tmp3, v_tmp1, v_one, v_two)))
-                    body.append(("valu", ("*", v_idx_A, v_idx_A, v_two)))
-                    body.append(("valu", ("+", v_idx_A, v_idx_A, v_tmp3)))
+                    body.append(("valu", ("&", v_tmp1, v_val_A, v_one)))
+                    body.append(("valu", ("+", v_tmp3, v_tmp1, v_one)))
+                    body.append(("valu", ("multiply_add", v_idx_A, v_idx_A, v_two, v_tmp3)))
                     for lane in range(VLEN):
                         body.append(("debug", ("compare", v_idx_A + lane, (round, offset_A + lane, "next_idx"))))
                     body.append(("valu", ("<", v_tmp1, v_idx_A, v_n_nodes)))
-                    body.append(("flow", ("vselect", v_idx_A, v_tmp1, v_idx_A, v_zero)))
+                    body.append(("valu", ("*", v_idx_A, v_idx_A, v_tmp1)))
                     for lane in range(VLEN):
                         body.append(("debug", ("compare", v_idx_A + lane, (round, offset_A + lane, "wrapped_idx"))))
                     
                     # Index computation - batch B
-                    body.append(("valu", ("%", v_tmp1, v_val_B, v_two)))
-                    body.append(("valu", ("==", v_tmp1, v_tmp1, v_zero)))
-                    body.append(("flow", ("vselect", v_tmp3, v_tmp1, v_one, v_two)))
-                    body.append(("valu", ("*", v_idx_B, v_idx_B, v_two)))
-                    body.append(("valu", ("+", v_idx_B, v_idx_B, v_tmp3)))
+                    body.append(("valu", ("&", v_tmp1, v_val_B, v_one)))
+                    body.append(("valu", ("+", v_tmp3, v_tmp1, v_one)))
+                    body.append(("valu", ("multiply_add", v_idx_B, v_idx_B, v_two, v_tmp3)))
                     for lane in range(VLEN):
                         body.append(("debug", ("compare", v_idx_B + lane, (round, offset_B + lane, "next_idx"))))
                     body.append(("valu", ("<", v_tmp1, v_idx_B, v_n_nodes)))
-                    body.append(("flow", ("vselect", v_idx_B, v_tmp1, v_idx_B, v_zero)))
+                    body.append(("valu", ("*", v_idx_B, v_idx_B, v_tmp1)))
                     for lane in range(VLEN):
                         body.append(("debug", ("compare", v_idx_B + lane, (round, offset_B + lane, "wrapped_idx"))))
                     
@@ -572,7 +572,6 @@ class KernelBuilder:
             self.add("load", ("const", tmp1, i))
             self.add("load", ("load", self.scratch[v], tmp1))
 
-        zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
 
@@ -593,12 +592,10 @@ class KernelBuilder:
         base_addr = self.alloc_scratch("base_addr")
 
         # Broadcast constants to vectors
-        v_zero = self.alloc_scratch("v_zero", VLEN)
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
 
-        body.append(("valu", ("vbroadcast", v_zero, zero_const)))
         body.append(("valu", ("vbroadcast", v_one, one_const)))
         body.append(("valu", ("vbroadcast", v_two, two_const)))
         body.append(("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"])))
@@ -656,24 +653,20 @@ class KernelBuilder:
                 for lane in range(VLEN):
                     body.append(("debug", ("compare", v_val + lane, (round, offset + lane, "hashed_val"))))
 
-                # v_tmp1 = v_val % 2
-                body.append(("valu", ("%", v_tmp1, v_val, v_two)))
-                # v_tmp1 = (v_tmp1 == 0)
-                body.append(("valu", ("==", v_tmp1, v_tmp1, v_zero)))
-                # v_tmp3 = select(v_tmp1, 1, 2)
-                body.append(("flow", ("vselect", v_tmp3, v_tmp1, v_one, v_two)))
-                # v_idx = v_idx * 2
-                body.append(("valu", ("*", v_idx, v_idx, v_two)))
-                # v_idx = v_idx + v_tmp3
-                body.append(("valu", ("+", v_idx, v_idx, v_tmp3)))
+                # v_tmp1 = v_val & 1
+                body.append(("valu", ("&", v_tmp1, v_val, v_one)))
+                # v_tmp3 = v_tmp1 + 1 (1 if even, 2 if odd)
+                body.append(("valu", ("+", v_tmp3, v_tmp1, v_one)))
+                # v_idx = v_idx * 2 + v_tmp3
+                body.append(("valu", ("multiply_add", v_idx, v_idx, v_two, v_tmp3)))
 
                 for lane in range(VLEN):
                     body.append(("debug", ("compare", v_idx + lane, (round, offset + lane, "next_idx"))))
 
                 # v_tmp1 = (v_idx < n_nodes)
                 body.append(("valu", ("<", v_tmp1, v_idx, v_n_nodes)))
-                # v_idx = select(v_tmp1, v_idx, 0)
-                body.append(("flow", ("vselect", v_idx, v_tmp1, v_idx, v_zero)))
+                # v_idx = v_idx * v_tmp1 (zero if out of range)
+                body.append(("valu", ("*", v_idx, v_idx, v_tmp1)))
 
                 for lane in range(VLEN):
                     body.append(("debug", ("compare", v_idx + lane, (round, offset + lane, "wrapped_idx"))))
@@ -726,7 +719,6 @@ class KernelBuilder:
             self.add("load", ("const", tmp1, i))
             self.add("load", ("load", self.scratch[v], tmp1))
 
-        zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
 
@@ -766,15 +758,14 @@ class KernelBuilder:
                 body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
                 body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
+                body.append(("alu", ("&", tmp1, tmp_val, one_const)))
+                body.append(("alu", ("+", tmp3, tmp1, one_const)))
                 body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
                 body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
                 body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
                 # idx = 0 if idx >= n_nodes else idx
                 body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
+                body.append(("alu", ("*", tmp_idx, tmp_idx, tmp1)))
                 body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
                 # mem[inp_indices_p + i] = idx
                 body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
