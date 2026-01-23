@@ -67,10 +67,27 @@ class KernelBuilder:
                 writes.add(dest)
                 reads.add(a1)
                 reads.add(a2)
+            elif engine == "valu":
+                if slot[0] == "vbroadcast":
+                    _, dest, src = slot
+                    for i in range(VLEN):
+                        writes.add(dest + i)
+                    reads.add(src)
+                else:
+                    op, dest, a1, a2 = slot[:4]
+                    for i in range(VLEN):
+                        writes.add(dest + i)
+                        reads.add(a1 + i)
+                        reads.add(a2 + i)
             elif engine == "load":
                 if slot[0] == "load":
                     _, dest, addr = slot
                     writes.add(dest)
+                    reads.add(addr)
+                elif slot[0] == "vload":
+                    _, dest, addr = slot
+                    for i in range(VLEN):
+                        writes.add(dest + i)
                     reads.add(addr)
                 elif slot[0] == "const":
                     _, dest, val = slot
@@ -80,6 +97,11 @@ class KernelBuilder:
                     _, addr, src = slot
                     reads.add(addr)
                     reads.add(src)
+                elif slot[0] == "vstore":
+                    _, addr, src = slot
+                    reads.add(addr)
+                    for i in range(VLEN):
+                        reads.add(src + i)
             elif engine == "flow":
                 if slot[0] == "select":
                     _, dest, cond, a, b = slot
@@ -87,12 +109,23 @@ class KernelBuilder:
                     reads.add(cond)
                     reads.add(a)
                     reads.add(b)
+                elif slot[0] == "vselect":
+                    _, dest, cond, a, b = slot
+                    for i in range(VLEN):
+                        writes.add(dest + i)
+                        reads.add(cond + i)
+                        reads.add(a + i)
+                        reads.add(b + i)
                 elif slot[0] == "pause":
                     pass
             elif engine == "debug":
                 if slot[0] == "compare":
                     _, loc, key = slot
                     reads.add(loc)
+                elif slot[0] == "vcompare":
+                    _, loc, keys = slot
+                    for i in range(VLEN):
+                        reads.add(loc + i)
 
             return reads, writes
 
@@ -163,11 +196,182 @@ class KernelBuilder:
 
         return slots
 
+    def build_hash_vectorized(self, val_hash_addr, v_tmp1, v_tmp2, v_hash_consts, round, base_offset):
+        """Vectorized hash for VLEN lanes at once. v_hash_consts is pre-allocated."""
+        slots = []
+
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            v_val1 = v_hash_consts[hi * 2]
+            v_val3 = v_hash_consts[hi * 2 + 1]
+
+            slots.append(("valu", (op1, v_tmp1, val_hash_addr, v_val1)))
+            slots.append(("valu", (op3, v_tmp2, val_hash_addr, v_val3)))
+            slots.append(("valu", (op2, val_hash_addr, v_tmp1, v_tmp2)))
+
+            # Debug each lane
+            for lane in range(VLEN):
+                slots.append(("debug", ("compare", val_hash_addr + lane, (round, base_offset + lane, "hash_stage", hi))))
+
+        return slots
+
+    def build_kernel_vectorized(
+        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
+    ):
+        """
+        Vectorized implementation processing VLEN items at a time.
+        """
+        tmp1 = self.alloc_scratch("tmp1")
+        tmp2 = self.alloc_scratch("tmp2")
+        tmp3 = self.alloc_scratch("tmp3")
+        # Scratch space addresses
+        init_vars = [
+            "rounds",
+            "n_nodes",
+            "batch_size",
+            "forest_height",
+            "forest_values_p",
+            "inp_indices_p",
+            "inp_values_p",
+        ]
+        for v in init_vars:
+            self.alloc_scratch(v, 1)
+        for i, v in enumerate(init_vars):
+            self.add("load", ("const", tmp1, i))
+            self.add("load", ("load", self.scratch[v], tmp1))
+
+        zero_const = self.scratch_const(0)
+        one_const = self.scratch_const(1)
+        two_const = self.scratch_const(2)
+
+        self.add("flow", ("pause",))
+        self.add("debug", ("comment", "Starting vectorized loop"))
+
+        body = []
+
+        # Vector scratch registers
+        v_idx = self.alloc_scratch("v_idx", VLEN)
+        v_val = self.alloc_scratch("v_val", VLEN)
+        v_node_val = self.alloc_scratch("v_node_val", VLEN)
+        v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
+        v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
+        v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
+
+        # Scalar temps for address computation
+        base_addr = self.alloc_scratch("base_addr")
+
+        # Broadcast constants to vectors
+        v_zero = self.alloc_scratch("v_zero", VLEN)
+        v_one = self.alloc_scratch("v_one", VLEN)
+        v_two = self.alloc_scratch("v_two", VLEN)
+        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
+
+        body.append(("valu", ("vbroadcast", v_zero, zero_const)))
+        body.append(("valu", ("vbroadcast", v_one, one_const)))
+        body.append(("valu", ("vbroadcast", v_two, two_const)))
+        body.append(("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"])))
+
+        # Pre-allocate and initialize hash constant vectors
+        v_hash_consts = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            val1_const = self.scratch_const(val1)
+            val3_const = self.scratch_const(val3)
+
+            v_val1 = self.alloc_scratch(f"v_hash_c1_{hi}", VLEN)
+            v_val3 = self.alloc_scratch(f"v_hash_c3_{hi}", VLEN)
+
+            body.append(("valu", ("vbroadcast", v_val1, val1_const)))
+            body.append(("valu", ("vbroadcast", v_val3, val3_const)))
+
+            v_hash_consts.append(v_val1)
+            v_hash_consts.append(v_val3)
+
+        num_vectors = batch_size // VLEN
+
+        for round in range(rounds):
+            for vec_i in range(num_vectors):
+                offset = vec_i * VLEN
+                offset_const = self.scratch_const(offset)
+
+                # Load indices: v_idx = vload(inp_indices_p + offset)
+                body.append(("alu", ("+", base_addr, self.scratch["inp_indices_p"], offset_const)))
+                body.append(("load", ("vload", v_idx, base_addr)))
+
+                # Add debug traces for each lane
+                for lane in range(VLEN):
+                    body.append(("debug", ("compare", v_idx + lane, (round, offset + lane, "idx"))))
+
+                # Load values: v_val = vload(inp_values_p + offset)
+                body.append(("alu", ("+", base_addr, self.scratch["inp_values_p"], offset_const)))
+                body.append(("load", ("vload", v_val, base_addr)))
+
+                for lane in range(VLEN):
+                    body.append(("debug", ("compare", v_val + lane, (round, offset + lane, "val"))))
+
+                # Load node values - need to do individually since indices differ
+                # node_val[i] = mem[forest_values_p + idx[i]]
+                for lane in range(VLEN):
+                    body.append(("alu", ("+", base_addr, self.scratch["forest_values_p"], v_idx + lane)))
+                    body.append(("load", ("load", v_node_val + lane, base_addr)))
+                    body.append(("debug", ("compare", v_node_val + lane, (round, offset + lane, "node_val"))))
+
+                # v_val = v_val ^ v_node_val
+                body.append(("valu", ("^", v_val, v_val, v_node_val)))
+
+                # Hash all lanes vectorized
+                body.extend(self.build_hash_vectorized(v_val, v_tmp1, v_tmp2, v_hash_consts, round, offset))
+
+                for lane in range(VLEN):
+                    body.append(("debug", ("compare", v_val + lane, (round, offset + lane, "hashed_val"))))
+
+                # v_tmp1 = v_val % 2
+                body.append(("valu", ("%", v_tmp1, v_val, v_two)))
+                # v_tmp1 = (v_tmp1 == 0)
+                body.append(("valu", ("==", v_tmp1, v_tmp1, v_zero)))
+                # v_tmp3 = select(v_tmp1, 1, 2)
+                body.append(("flow", ("vselect", v_tmp3, v_tmp1, v_one, v_two)))
+                # v_idx = v_idx * 2
+                body.append(("valu", ("*", v_idx, v_idx, v_two)))
+                # v_idx = v_idx + v_tmp3
+                body.append(("valu", ("+", v_idx, v_idx, v_tmp3)))
+
+                for lane in range(VLEN):
+                    body.append(("debug", ("compare", v_idx + lane, (round, offset + lane, "next_idx"))))
+
+                # v_tmp1 = (v_idx < n_nodes)
+                body.append(("valu", ("<", v_tmp1, v_idx, v_n_nodes)))
+                # v_idx = select(v_tmp1, v_idx, 0)
+                body.append(("flow", ("vselect", v_idx, v_tmp1, v_idx, v_zero)))
+
+                for lane in range(VLEN):
+                    body.append(("debug", ("compare", v_idx + lane, (round, offset + lane, "wrapped_idx"))))
+
+                # Store results
+                body.append(("alu", ("+", base_addr, self.scratch["inp_indices_p"], offset_const)))
+                body.append(("store", ("vstore", base_addr, v_idx)))
+
+                body.append(("alu", ("+", base_addr, self.scratch["inp_values_p"], offset_const)))
+                body.append(("store", ("vstore", base_addr, v_val)))
+
+        body_instrs = self.build(body, vliw=True)
+        self.instrs.extend(body_instrs)
+        self.instrs.append({"flow": [("pause",)]})
+
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Like reference_kernel2 but building actual instructions.
+        Main entry point - uses vectorized implementation.
+        """
+        # Use vectorized implementation if batch_size is divisible by VLEN
+        if batch_size % VLEN == 0:
+            return self.build_kernel_vectorized(forest_height, n_nodes, batch_size, rounds)
+        else:
+            return self.build_kernel_scalar(forest_height, n_nodes, batch_size, rounds)
+
+    def build_kernel_scalar(
+        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
+    ):
+        """
         Scalar implementation using only scalar ALU and load/store.
         """
         tmp1 = self.alloc_scratch("tmp1")
