@@ -49,10 +49,88 @@ class KernelBuilder:
         return DebugInfo(scratch_map=self.scratch_debug)
 
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
+        if not vliw:
+            # Simple slot packing that just uses one slot per instruction bundle
+            instrs = []
+            for engine, slot in slots:
+                instrs.append({engine: [slot]})
+            return instrs
+
+        # VLIW packing: pack independent operations into same cycle
+        # Track which scratch addresses are written/read in each slot
+        def get_deps(engine, slot):
+            writes = set()
+            reads = set()
+
+            if engine == "alu":
+                op, dest, a1, a2 = slot
+                writes.add(dest)
+                reads.add(a1)
+                reads.add(a2)
+            elif engine == "load":
+                if slot[0] == "load":
+                    _, dest, addr = slot
+                    writes.add(dest)
+                    reads.add(addr)
+                elif slot[0] == "const":
+                    _, dest, val = slot
+                    writes.add(dest)
+            elif engine == "store":
+                if slot[0] == "store":
+                    _, addr, src = slot
+                    reads.add(addr)
+                    reads.add(src)
+            elif engine == "flow":
+                if slot[0] == "select":
+                    _, dest, cond, a, b = slot
+                    writes.add(dest)
+                    reads.add(cond)
+                    reads.add(a)
+                    reads.add(b)
+                elif slot[0] == "pause":
+                    pass
+            elif engine == "debug":
+                if slot[0] == "compare":
+                    _, loc, key = slot
+                    reads.add(loc)
+
+            return reads, writes
+
+        # Pack slots into instructions respecting dependencies and slot limits
+        # O(n) greedy packing: single pass, pack greedily
         instrs = []
+        current_instr = {}
+        slot_counts = {name: 0 for name in SLOT_LIMITS}
+        written_this_cycle = set()
+
         for engine, slot in slots:
-            instrs.append({engine: [slot]})
+            reads, writes = get_deps(engine, slot)
+
+            # Check if we need to start a new cycle
+            need_new_cycle = (
+                slot_counts[engine] >= SLOT_LIMITS[engine] or
+                bool(reads & written_this_cycle)
+            )
+
+            if need_new_cycle:
+                # Flush current instruction and start new one
+                if current_instr:
+                    instrs.append(current_instr)
+                current_instr = {}
+                slot_counts = {name: 0 for name in SLOT_LIMITS}
+                written_this_cycle = set()
+
+            # Add slot to current instruction
+            if engine not in current_instr:
+                current_instr[engine] = []
+            current_instr[engine].append(slot)
+            slot_counts[engine] += 1
+            written_this_cycle.update(writes)
+
+        # Don't forget the last instruction
+        if current_instr:
+            instrs.append(current_instr)
+
         return instrs
 
     def add(self, engine, slot):
@@ -168,7 +246,7 @@ class KernelBuilder:
                 body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
                 body.append(("store", ("store", tmp_addr, tmp_val)))
 
-        body_instrs = self.build(body)
+        body_instrs = self.build(body, vliw=True)
         self.instrs.extend(body_instrs)
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
