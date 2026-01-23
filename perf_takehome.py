@@ -252,7 +252,7 @@ class KernelBuilder:
         """
         Software pipelined implementation with deeper overlapping:
         - Process 2 batches simultaneously (A and B register sets)
-        - Interleave load/gather of next batch with compute of current batch
+        - Interleave gather and compute across batches
         """
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
@@ -282,26 +282,24 @@ class KernelBuilder:
 
         body = []
 
-        # Allocate TWO sets of vector registers for double buffering
-        # Set A
-        v_idx_A = self.alloc_scratch("v_idx_A", VLEN)
-        v_val_A = self.alloc_scratch("v_val_A", VLEN)
+        num_vectors = batch_size // VLEN
+
+        # Scratch-resident banks for all indices/values across rounds.
+        v_idx_bank = self.alloc_scratch("v_idx_bank", num_vectors * VLEN)
+        v_val_bank = self.alloc_scratch("v_val_bank", num_vectors * VLEN)
+
+        # Per-batch node values (transient).
         v_node_val_A = self.alloc_scratch("v_node_val_A", VLEN)
-        
-        # Set B
-        v_idx_B = self.alloc_scratch("v_idx_B", VLEN)
-        v_val_B = self.alloc_scratch("v_val_B", VLEN)
         v_node_val_B = self.alloc_scratch("v_node_val_B", VLEN)
-        
+
         # Shared temporaries (v_tmp4 used to keep A/B hash temps independent)
         v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
         v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
         v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
         v_tmp4 = self.alloc_scratch("v_tmp4", VLEN)
 
-        # Scalar temps for address computation - need two for parallel loads
+        # Scalar temps for address computation
         base_addr_A = self.alloc_scratch("base_addr_A")
-        base_addr_B = self.alloc_scratch("base_addr_B")
         node_addr_tmp = self.alloc_scratch("node_addr_tmp")
         node_addr_tmp2 = self.alloc_scratch("node_addr_tmp2")
 
@@ -329,17 +327,26 @@ class KernelBuilder:
             v_hash_consts.append(v_val1)
             v_hash_consts.append(v_val3)
 
-        num_vectors = batch_size // VLEN
+        # Preload shallow-level node values to avoid scattered loads.
+        v_root = self.alloc_scratch("v_root", VLEN)
+        v_node1 = self.alloc_scratch("v_node1", VLEN)
+        v_node2 = self.alloc_scratch("v_node2", VLEN)
+        v_node1_minus_node2 = self.alloc_scratch("v_node1_minus_node2", VLEN)
 
-        # Helper to generate load phase for a batch (vloads for indices and values)
-        def gen_load_phase(v_idx, v_val, base_addr, offset_const):
-            slots = []
-            slots.append(("alu", ("+", base_addr, self.scratch["inp_indices_p"], offset_const)))
-            slots.append(("load", ("vload", v_idx, base_addr)))
-            slots.append(("alu", ("+", base_addr, self.scratch["inp_values_p"], offset_const)))
-            slots.append(("load", ("vload", v_val, base_addr)))
-            return slots
-        
+        # root (index 0)
+        body.append(("load", ("load", tmp1, self.scratch["forest_values_p"])))
+        body.append(("valu", ("vbroadcast", v_root, tmp1)))
+        # node 1
+        body.append(("alu", ("+", base_addr_A, self.scratch["forest_values_p"], one_const)))
+        body.append(("load", ("load", tmp1, base_addr_A)))
+        body.append(("valu", ("vbroadcast", v_node1, tmp1)))
+        # node 2
+        body.append(("alu", ("+", base_addr_A, self.scratch["forest_values_p"], two_const)))
+        body.append(("load", ("load", tmp1, base_addr_A)))
+        body.append(("valu", ("vbroadcast", v_node2, tmp1)))
+        # diff for level-1 selection
+        body.append(("valu", ("-", v_node1_minus_node2, v_node1, v_node2)))
+
         # Helper to generate gather phase (node value loads - 2 loads per cycle)
         def gen_gather_phase(v_idx, v_node_val):
             slots = []
@@ -377,23 +384,24 @@ class KernelBuilder:
                 slots.append(("debug", ("compare", v_idx + lane, (round, offset + lane, "wrapped_idx"))))
             return slots
 
-        # Helper to generate store phase
-        def gen_store_phase(v_idx, v_val, base_addr, offset_const):
-            slots = []
-            slots.append(("alu", ("+", base_addr, self.scratch["inp_indices_p"], offset_const)))
-            slots.append(("store", ("vstore", base_addr, v_idx)))
-            slots.append(("alu", ("+", base_addr, self.scratch["inp_values_p"], offset_const)))
-            slots.append(("store", ("vstore", base_addr, v_val)))
-            return slots
-
         # Pre-compute all offset constants
         offset_consts = []
         for vec_i in range(num_vectors):
             offset_consts.append(self.scratch_const(vec_i * VLEN))
 
+        # Preload idx/val into scratch banks once.
+        for vec_i in range(num_vectors):
+            offset = vec_i * VLEN
+            offset_const = offset_consts[vec_i]
+            body.append(("alu", ("+", base_addr_A, self.scratch["inp_indices_p"], offset_const)))
+            body.append(("load", ("vload", v_idx_bank + offset, base_addr_A)))
+            body.append(("alu", ("+", base_addr_A, self.scratch["inp_values_p"], offset_const)))
+            body.append(("load", ("vload", v_val_bank + offset, base_addr_A)))
+
         for round in range(rounds):
+            level = round % (forest_height + 1)
             # Process batches in pairs, interleaving their operations
-            # This allows the VLIW packer to overlap load/store with compute
+            # This allows the VLIW packer to overlap gathers with compute
             
             vec_i = 0
             while vec_i < num_vectors:
@@ -405,23 +413,10 @@ class KernelBuilder:
                     # Batch A (even index), Batch B (odd index)
                     offset_A = vec_i * VLEN
                     offset_B = (vec_i + 1) * VLEN
-                    offset_const_A = offset_consts[vec_i]
-                    offset_const_B = offset_consts[vec_i + 1]
-                    
-                    # === PHASE 1: Load both batches ===
-                    # Load A indices
-                    body.append(("alu", ("+", base_addr_A, self.scratch["inp_indices_p"], offset_const_A)))
-                    # Load B indices (can overlap with A)
-                    body.append(("alu", ("+", base_addr_B, self.scratch["inp_indices_p"], offset_const_B)))
-                    body.append(("load", ("vload", v_idx_A, base_addr_A)))
-                    body.append(("load", ("vload", v_idx_B, base_addr_B)))
-                    
-                    # Load A values
-                    body.append(("alu", ("+", base_addr_A, self.scratch["inp_values_p"], offset_const_A)))
-                    # Load B values
-                    body.append(("alu", ("+", base_addr_B, self.scratch["inp_values_p"], offset_const_B)))
-                    body.append(("load", ("vload", v_val_A, base_addr_A)))
-                    body.append(("load", ("vload", v_val_B, base_addr_B)))
+                    v_idx_A = v_idx_bank + offset_A
+                    v_val_A = v_val_bank + offset_A
+                    v_idx_B = v_idx_bank + offset_B
+                    v_val_B = v_val_bank + offset_B
                     
                     # Debug for both batches
                     for lane in range(VLEN):
@@ -431,23 +426,34 @@ class KernelBuilder:
                         body.append(("debug", ("compare", v_idx_B + lane, (round, offset_B + lane, "idx"))))
                         body.append(("debug", ("compare", v_val_B + lane, (round, offset_B + lane, "val"))))
                     
-                    # === PHASE 2: Gather node values for both batches ===
-                    # Interleave the gathers
-                    for pair in range(VLEN // 2):
-                        lane0 = pair * 2
-                        lane1 = pair * 2 + 1
-                        # Batch A addresses
-                        body.append(("alu", ("+", node_addr_tmp, self.scratch["forest_values_p"], v_idx_A + lane0)))
-                        body.append(("alu", ("+", node_addr_tmp2, self.scratch["forest_values_p"], v_idx_A + lane1)))
-                        body.append(("load", ("load", v_node_val_A + lane0, node_addr_tmp)))
-                        body.append(("load", ("load", v_node_val_A + lane1, node_addr_tmp2)))
-                    for pair in range(VLEN // 2):
-                        lane0 = pair * 2
-                        lane1 = pair * 2 + 1
-                        body.append(("alu", ("+", node_addr_tmp, self.scratch["forest_values_p"], v_idx_B + lane0)))
-                        body.append(("alu", ("+", node_addr_tmp2, self.scratch["forest_values_p"], v_idx_B + lane1)))
-                        body.append(("load", ("load", v_node_val_B + lane0, node_addr_tmp)))
-                        body.append(("load", ("load", v_node_val_B + lane1, node_addr_tmp2)))
+                    # Gather node values for both batches
+                    if level == 0:
+                        body.append(("valu", ("*", v_node_val_A, v_root, v_one)))
+                        body.append(("valu", ("*", v_node_val_B, v_root, v_one)))
+                    elif level == 1:
+                        body.append(("valu", ("&", v_tmp1, v_idx_A, v_one)))
+                        body.append(("valu", ("&", v_tmp2, v_idx_B, v_one)))
+                        body.append(("valu", ("*", v_tmp1, v_node1_minus_node2, v_tmp1)))
+                        body.append(("valu", ("*", v_tmp2, v_node1_minus_node2, v_tmp2)))
+                        body.append(("valu", ("+", v_node_val_A, v_node2, v_tmp1)))
+                        body.append(("valu", ("+", v_node_val_B, v_node2, v_tmp2)))
+                    else:
+                        # Interleave the gathers
+                        for pair in range(VLEN // 2):
+                            lane0 = pair * 2
+                            lane1 = pair * 2 + 1
+                            # Batch A addresses
+                            body.append(("alu", ("+", node_addr_tmp, self.scratch["forest_values_p"], v_idx_A + lane0)))
+                            body.append(("alu", ("+", node_addr_tmp2, self.scratch["forest_values_p"], v_idx_A + lane1)))
+                            body.append(("load", ("load", v_node_val_A + lane0, node_addr_tmp)))
+                            body.append(("load", ("load", v_node_val_A + lane1, node_addr_tmp2)))
+                        for pair in range(VLEN // 2):
+                            lane0 = pair * 2
+                            lane1 = pair * 2 + 1
+                            body.append(("alu", ("+", node_addr_tmp, self.scratch["forest_values_p"], v_idx_B + lane0)))
+                            body.append(("alu", ("+", node_addr_tmp2, self.scratch["forest_values_p"], v_idx_B + lane1)))
+                            body.append(("load", ("load", v_node_val_B + lane0, node_addr_tmp)))
+                            body.append(("load", ("load", v_node_val_B + lane1, node_addr_tmp2)))
                     
                     # Debug node values
                     for lane in range(VLEN):
@@ -455,7 +461,7 @@ class KernelBuilder:
                     for lane in range(VLEN):
                         body.append(("debug", ("compare", v_node_val_B + lane, (round, offset_B + lane, "node_val"))))
                     
-                    # === PHASE 3: Compute for both batches ===
+                    # Compute for both batches
                     # Interleave compute operations more aggressively
                     # XOR phase - both batches
                     body.append(("valu", ("^", v_val_A, v_val_A, v_node_val_A)))
@@ -508,30 +514,26 @@ class KernelBuilder:
                     for lane in range(VLEN):
                         body.append(("debug", ("compare", v_val_B + lane, (round, offset_B + lane, "hashed_val"))))
                     
-                    # === PHASE 4: Store both batches ===
-                    body.append(("alu", ("+", base_addr_A, self.scratch["inp_indices_p"], offset_const_A)))
-                    body.append(("alu", ("+", base_addr_B, self.scratch["inp_indices_p"], offset_const_B)))
-                    body.append(("store", ("vstore", base_addr_A, v_idx_A)))
-                    body.append(("store", ("vstore", base_addr_B, v_idx_B)))
-                    
-                    body.append(("alu", ("+", base_addr_A, self.scratch["inp_values_p"], offset_const_A)))
-                    body.append(("alu", ("+", base_addr_B, self.scratch["inp_values_p"], offset_const_B)))
-                    body.append(("store", ("vstore", base_addr_A, v_val_A)))
-                    body.append(("store", ("vstore", base_addr_B, v_val_B)))
-                    
                     vec_i += 2
                 else:
                     # Single batch (last one if odd number)
-                    v_idx, v_val, v_node_val, base_addr = v_idx_A, v_val_A, v_node_val_A, base_addr_A
-                    offset_const = offset_consts[vec_i]
                     offset = vec_i * VLEN
+                    v_idx = v_idx_bank + offset
+                    v_val = v_val_bank + offset
+                    v_node_val = v_node_val_A
                     
-                    body.extend(gen_load_phase(v_idx, v_val, base_addr, offset_const))
                     for lane in range(VLEN):
                         body.append(("debug", ("compare", v_idx + lane, (round, offset + lane, "idx"))))
                         body.append(("debug", ("compare", v_val + lane, (round, offset + lane, "val"))))
                     
-                    body.extend(gen_gather_phase(v_idx, v_node_val))
+                    if level == 0:
+                        body.append(("valu", ("*", v_node_val, v_root, v_one)))
+                    elif level == 1:
+                        body.append(("valu", ("&", v_tmp1, v_idx, v_one)))
+                        body.append(("valu", ("*", v_tmp1, v_node1_minus_node2, v_tmp1)))
+                        body.append(("valu", ("+", v_node_val, v_node2, v_tmp1)))
+                    else:
+                        body.extend(gen_gather_phase(v_idx, v_node_val))
                     for lane in range(VLEN):
                         body.append(("debug", ("compare", v_node_val + lane, (round, offset + lane, "node_val"))))
                     
@@ -539,9 +541,16 @@ class KernelBuilder:
                     for lane in range(VLEN):
                         body.append(("debug", ("compare", v_val + lane, (round, offset + lane, "hashed_val"))))
                     
-                    body.extend(gen_store_phase(v_idx, v_val, base_addr, offset_const))
-                    
                     vec_i += 1
+
+        # Store back idx/val from scratch banks once.
+        for vec_i in range(num_vectors):
+            offset = vec_i * VLEN
+            offset_const = offset_consts[vec_i]
+            body.append(("alu", ("+", base_addr_A, self.scratch["inp_indices_p"], offset_const)))
+            body.append(("store", ("vstore", base_addr_A, v_idx_bank + offset)))
+            body.append(("alu", ("+", base_addr_A, self.scratch["inp_values_p"], offset_const)))
+            body.append(("store", ("vstore", base_addr_A, v_val_bank + offset)))
 
         body_instrs = self.build(body, vliw=True)
         self.instrs.extend(body_instrs)
