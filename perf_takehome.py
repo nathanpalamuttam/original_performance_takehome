@@ -135,13 +135,15 @@ class KernelBuilder:
         two_const = self.scratch_const(2)
         self.add("flow", ("pause",))
 
-        body = []
         num_vectors = batch_size // VLEN
 
         v_idx_bank = self.alloc_scratch("v_idx_bank", num_vectors * VLEN)
         v_val_bank = self.alloc_scratch("v_val_bank", num_vectors * VLEN)
-        # Use 6 batches for better hash efficiency
-        v_node_vals = [self.alloc_scratch(f"v_node_val_{i}", VLEN) for i in range(6)]
+        # Use 6 batches for better hash efficiency, double-buffered
+        v_node_bufs = [
+            [self.alloc_scratch(f"v_node_val0_{i}", VLEN) for i in range(6)],
+            [self.alloc_scratch(f"v_node_val1_{i}", VLEN) for i in range(6)],
+        ]
         first_tmps = [self.alloc_scratch(f"v_tmp1_{i}", VLEN) for i in range(6)]
         second_tmps = [self.alloc_scratch(f"v_tmp2_{i}", VLEN) for i in range(6)]
         base_addr_A = self.alloc_scratch("base_addr_A")
@@ -151,138 +153,277 @@ class KernelBuilder:
         node_addr_tmp4 = self.alloc_scratch("node_addr_tmp4")
         v_one, v_two, v_n_nodes = [self.alloc_scratch(n, VLEN) for n in ["v_one", "v_two", "v_n_nodes"]]
 
-        body.append(("valu", ("vbroadcast", v_one, one_const)))
-        body.append(("valu", ("vbroadcast", v_two, two_const)))
-        body.append(("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"])))
+        init_body = []
+        init_body.append(("valu", ("vbroadcast", v_one, one_const)))
+        init_body.append(("valu", ("vbroadcast", v_two, two_const)))
+        init_body.append(("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"])))
 
         v_hash_consts = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             v_val1 = self.alloc_scratch(f"v_hash_c1_{hi}", VLEN)
             v_val3 = self.alloc_scratch(f"v_hash_c3_{hi}", VLEN)
-            body.append(("valu", ("vbroadcast", v_val1, self.scratch_const(val1))))
-            body.append(("valu", ("vbroadcast", v_val3, self.scratch_const(val3))))
+            init_body.append(("valu", ("vbroadcast", v_val1, self.scratch_const(val1))))
+            init_body.append(("valu", ("vbroadcast", v_val3, self.scratch_const(val3))))
             v_hash_consts.extend([v_val1, v_val3])
 
         v_root, v_node1, v_node2 = [self.alloc_scratch(n, VLEN) for n in ["v_root", "v_node1", "v_node2"]]
         v_node1_minus_node2 = self.alloc_scratch("v_node1_minus_node2", VLEN)
 
-        body.append(("load", ("load", tmp1, self.scratch["forest_values_p"])))
-        body.append(("valu", ("vbroadcast", v_root, tmp1)))
-        body.append(("alu", ("+", base_addr_A, self.scratch["forest_values_p"], one_const)))
-        body.append(("load", ("load", tmp1, base_addr_A)))
-        body.append(("valu", ("vbroadcast", v_node1, tmp1)))
-        body.append(("alu", ("+", base_addr_A, self.scratch["forest_values_p"], two_const)))
-        body.append(("load", ("load", tmp1, base_addr_A)))
-        body.append(("valu", ("vbroadcast", v_node2, tmp1)))
-        body.append(("valu", ("-", v_node1_minus_node2, v_node1, v_node2)))
+        init_body.append(("load", ("load", tmp1, self.scratch["forest_values_p"])))
+        init_body.append(("valu", ("vbroadcast", v_root, tmp1)))
+        init_body.append(("alu", ("+", base_addr_A, self.scratch["forest_values_p"], one_const)))
+        init_body.append(("load", ("load", tmp1, base_addr_A)))
+        init_body.append(("valu", ("vbroadcast", v_node1, tmp1)))
+        init_body.append(("alu", ("+", base_addr_A, self.scratch["forest_values_p"], two_const)))
+        init_body.append(("load", ("load", tmp1, base_addr_A)))
+        init_body.append(("valu", ("vbroadcast", v_node2, tmp1)))
+        init_body.append(("valu", ("-", v_node1_minus_node2, v_node1, v_node2)))
 
         offset_consts = [self.scratch_const(vec_i * VLEN) for vec_i in range(num_vectors)]
 
         for vec_i in range(num_vectors):
             offset_const = offset_consts[vec_i]
-            body.append(("alu", ("+", base_addr_A, self.scratch["inp_indices_p"], offset_const)))
-            body.append(("load", ("vload", v_idx_bank + vec_i * VLEN, base_addr_A)))
-            body.append(("alu", ("+", base_addr_A, self.scratch["inp_values_p"], offset_const)))
-            body.append(("load", ("vload", v_val_bank + vec_i * VLEN, base_addr_A)))
+            init_body.append(("alu", ("+", base_addr_A, self.scratch["inp_indices_p"], offset_const)))
+            init_body.append(("load", ("vload", v_idx_bank + vec_i * VLEN, base_addr_A)))
+            init_body.append(("alu", ("+", base_addr_A, self.scratch["inp_values_p"], offset_const)))
+            init_body.append(("load", ("vload", v_val_bank + vec_i * VLEN, base_addr_A)))
+
+        self.instrs.extend(self.build(init_body, vliw=True))
+
+        def chunk_slots(slots, limit):
+            for i in range(0, len(slots), limit):
+                yield slots[i : i + limit]
+
+        def emit_debug_slots(slots):
+            if not self.enable_debug:
+                return
+            limit = SLOT_LIMITS["debug"]
+            for i in range(0, len(slots), limit):
+                self.instrs.append({"debug": slots[i : i + limit]})
+
+        def debug_idx_val(round_i, offsets, v_idxs, v_vals):
+            if not self.enable_debug:
+                return
+            slots = []
+            for b in range(len(v_idxs)):
+                base = offsets[b]
+                for lane in range(VLEN):
+                    slots.append(("compare", v_idxs[b] + lane, (round_i, base + lane, "idx")))
+                    slots.append(("compare", v_vals[b] + lane, (round_i, base + lane, "val")))
+            emit_debug_slots(slots)
+
+        def debug_node_val(round_i, offsets, v_node_vals):
+            if not self.enable_debug:
+                return
+            slots = []
+            for b in range(len(v_node_vals)):
+                base = offsets[b]
+                for lane in range(VLEN):
+                    slots.append(("compare", v_node_vals[b] + lane, (round_i, base + lane, "node_val")))
+            emit_debug_slots(slots)
+
+        def debug_hash_stage(round_i, offsets, v_vals, hi):
+            if not self.enable_debug:
+                return
+            slots = []
+            for b in range(len(v_vals)):
+                base = offsets[b]
+                for lane in range(VLEN):
+                    slots.append(("compare", v_vals[b] + lane, (round_i, base + lane, "hash_stage", hi)))
+            emit_debug_slots(slots)
+
+        def debug_next_idx(round_i, offsets, v_idxs):
+            if not self.enable_debug:
+                return
+            slots = []
+            for b in range(len(v_idxs)):
+                base = offsets[b]
+                for lane in range(VLEN):
+                    slots.append(("compare", v_idxs[b] + lane, (round_i, base + lane, "next_idx")))
+            emit_debug_slots(slots)
+
+        def debug_wrapped_idx_hashed_val(round_i, offsets, v_idxs, v_vals):
+            if not self.enable_debug:
+                return
+            slots = []
+            for b in range(len(v_idxs)):
+                base = offsets[b]
+                for lane in range(VLEN):
+                    slots.append(("compare", v_idxs[b] + lane, (round_i, base + lane, "wrapped_idx")))
+                    slots.append(("compare", v_vals[b] + lane, (round_i, base + lane, "hashed_val")))
+            emit_debug_slots(slots)
+
+        addr_sets = [(node_addr_tmp, node_addr_tmp2), (node_addr_tmp3, node_addr_tmp4)]
+
+        def build_gather_cycles(v_idxs, v_node_vals):
+            pairs = []
+            for b in range(len(v_idxs)):
+                for pair in range(VLEN // 2):
+                    l0 = pair * 2
+                    pairs.append((b, l0, l0 + 1))
+            if not pairs:
+                return []
+            cycles = []
+            set_idx = 0
+            b, l0, l1 = pairs[0]
+            addr0, addr1 = addr_sets[set_idx]
+            cycles.append({
+                "alu": [
+                    ("+", addr0, self.scratch["forest_values_p"], v_idxs[b] + l0),
+                    ("+", addr1, self.scratch["forest_values_p"], v_idxs[b] + l1),
+                ],
+            })
+            pending_b, pending_l0, pending_l1, pending_a0, pending_a1 = b, l0, l1, addr0, addr1
+            set_idx = 1 - set_idx
+            for b, l0, l1 in pairs[1:]:
+                addr0, addr1 = addr_sets[set_idx]
+                cycles.append({
+                    "load": [
+                        ("load", v_node_vals[pending_b] + pending_l0, pending_a0),
+                        ("load", v_node_vals[pending_b] + pending_l1, pending_a1),
+                    ],
+                    "alu": [
+                        ("+", addr0, self.scratch["forest_values_p"], v_idxs[b] + l0),
+                        ("+", addr1, self.scratch["forest_values_p"], v_idxs[b] + l1),
+                    ],
+                })
+                pending_b, pending_l0, pending_l1, pending_a0, pending_a1 = b, l0, l1, addr0, addr1
+                set_idx = 1 - set_idx
+            cycles.append({
+                "load": [
+                    ("load", v_node_vals[pending_b] + pending_l0, pending_a0),
+                    ("load", v_node_vals[pending_b] + pending_l1, pending_a1),
+                ],
+            })
+            return cycles
+
+        def build_level0_cycles(v_node_vals):
+            slots = [("*", v_node_vals[b], v_root, v_one) for b in range(len(v_node_vals))]
+            return [{"valu": chunk} for chunk in chunk_slots(slots, SLOT_LIMITS["valu"])]
+
+        def build_level1_cycles(v_idxs, v_node_vals, tmps):
+            cycles = []
+            slots = [("&", tmps[b], v_idxs[b], v_one) for b in range(len(v_node_vals))]
+            cycles.extend({"valu": chunk} for chunk in chunk_slots(slots, SLOT_LIMITS["valu"]))
+            slots = [("*", tmps[b], v_node1_minus_node2, tmps[b]) for b in range(len(v_node_vals))]
+            cycles.extend({"valu": chunk} for chunk in chunk_slots(slots, SLOT_LIMITS["valu"]))
+            slots = [("+", v_node_vals[b], v_node2, tmps[b]) for b in range(len(v_node_vals))]
+            cycles.extend({"valu": chunk} for chunk in chunk_slots(slots, SLOT_LIMITS["valu"]))
+            return cycles
+
+        def emit_hash_with_gather(round_i, offsets, v_idxs, v_vals, v_node_vals, first_tmps_batch, second_tmps_batch, gather_cycles):
+            g_idx = 0
+            batches = len(v_vals)
+
+            def emit_cycle(cycle):
+                nonlocal g_idx
+                if g_idx < len(gather_cycles):
+                    for eng, slots in gather_cycles[g_idx].items():
+                        cycle.setdefault(eng, []).extend(slots)
+                    g_idx += 1
+                if "valu" in cycle:
+                    assert len(cycle["valu"]) <= SLOT_LIMITS["valu"]
+                if "load" in cycle:
+                    assert len(cycle["load"]) <= SLOT_LIMITS["load"]
+                if "alu" in cycle:
+                    assert len(cycle["alu"]) <= SLOT_LIMITS["alu"]
+                self.instrs.append(cycle)
+
+            xor_slots = [("^", v_vals[b], v_vals[b], v_node_vals[b]) for b in range(batches)]
+            for chunk in chunk_slots(xor_slots, SLOT_LIMITS["valu"]):
+                emit_cycle({"valu": chunk})
+
+            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                v_c1, v_c3 = v_hash_consts[hi * 2], v_hash_consts[hi * 2 + 1]
+                stage_slots = []
+                for b in range(batches):
+                    stage_slots.append((op1, first_tmps_batch[b], v_vals[b], v_c1))
+                    stage_slots.append((op3, second_tmps_batch[b], v_vals[b], v_c3))
+                for chunk in chunk_slots(stage_slots, SLOT_LIMITS["valu"]):
+                    emit_cycle({"valu": chunk})
+                op2_slots = [(op2, v_vals[b], first_tmps_batch[b], second_tmps_batch[b]) for b in range(batches)]
+                for chunk in chunk_slots(op2_slots, SLOT_LIMITS["valu"]):
+                    emit_cycle({"valu": chunk})
+                debug_hash_stage(round_i, offsets, v_vals, hi)
+
+            slots = [("&", first_tmps_batch[b], v_vals[b], v_one) for b in range(batches)]
+            for chunk in chunk_slots(slots, SLOT_LIMITS["valu"]):
+                emit_cycle({"valu": chunk})
+            slots = [("+", second_tmps_batch[b], first_tmps_batch[b], v_one) for b in range(batches)]
+            for chunk in chunk_slots(slots, SLOT_LIMITS["valu"]):
+                emit_cycle({"valu": chunk})
+            slots = [("multiply_add", v_idxs[b], v_idxs[b], v_two, second_tmps_batch[b]) for b in range(batches)]
+            for chunk in chunk_slots(slots, SLOT_LIMITS["valu"]):
+                emit_cycle({"valu": chunk})
+            debug_next_idx(round_i, offsets, v_idxs)
+
+            slots = [("<", first_tmps_batch[b], v_idxs[b], v_n_nodes) for b in range(batches)]
+            for chunk in chunk_slots(slots, SLOT_LIMITS["valu"]):
+                emit_cycle({"valu": chunk})
+            slots = [("*", v_idxs[b], v_idxs[b], first_tmps_batch[b]) for b in range(batches)]
+            for chunk in chunk_slots(slots, SLOT_LIMITS["valu"]):
+                emit_cycle({"valu": chunk})
+            debug_wrapped_idx_hashed_val(round_i, offsets, v_idxs, v_vals)
+
+            while g_idx < len(gather_cycles):
+                self.instrs.append(gather_cycles[g_idx])
+                g_idx += 1
 
         for round in range(rounds):
             level = round % (forest_height + 1)
             vec_i = 0
+            buf_sel = 0
+
+            if level >= 2 and num_vectors:
+                batches = min(6, num_vectors)
+                v_idxs0 = [v_idx_bank + i * VLEN for i in range(batches)]
+                v_node_vals0 = v_node_bufs[buf_sel][:batches]
+                self.instrs.extend(build_gather_cycles(v_idxs0, v_node_vals0))
+
             while vec_i < num_vectors:
                 batches = min(6, num_vectors - vec_i)
-                
                 offsets = [vec_i * VLEN + i * VLEN for i in range(batches)]
                 v_idxs = [v_idx_bank + o for o in offsets]
                 v_vals = [v_val_bank + o for o in offsets]
-                v_node_val_batch = v_node_vals[:batches]
-                
-                # Debug
-                for b in range(batches):
-                    for lane in range(VLEN):
-                        body.append(("debug", ("compare", v_idxs[b] + lane, (round, offsets[b] + lane, "idx"))))
-                        body.append(("debug", ("compare", v_vals[b] + lane, (round, offsets[b] + lane, "val"))))
-                
-                # Gather node values
-                if level == 0:
-                    for b in range(batches):
-                        body.append(("valu", ("*", v_node_val_batch[b], v_root, v_one)))
-                elif level == 1:
-                    tmps = first_tmps[:batches]
-                    for b in range(batches):
-                        body.append(("valu", ("&", tmps[b], v_idxs[b], v_one)))
-                    for b in range(batches):
-                        body.append(("valu", ("*", tmps[b], v_node1_minus_node2, tmps[b])))
-                    for b in range(batches):
-                        body.append(("valu", ("+", v_node_val_batch[b], v_node2, tmps[b])))
-                else:
-                    # Gather from memory
-                    addr_tmps = [node_addr_tmp, node_addr_tmp2]
-                    for b in range(batches):
-                        for pair in range(VLEN // 2):
-                            l0, l1 = pair * 2, pair * 2 + 1
-                            body.append(("alu", ("+", addr_tmps[0], self.scratch["forest_values_p"], v_idxs[b] + l0)))
-                            body.append(("alu", ("+", addr_tmps[1], self.scratch["forest_values_p"], v_idxs[b] + l1)))
-                            body.append(("load", ("load", v_node_val_batch[b] + l0, addr_tmps[0])))
-                            body.append(("load", ("load", v_node_val_batch[b] + l1, addr_tmps[1])))
-                
-                for b in range(batches):
-                    for lane in range(VLEN):
-                        body.append(("debug", ("compare", v_node_val_batch[b] + lane, (round, offsets[b] + lane, "node_val"))))
-                
-                # XOR all batches
-                for b in range(batches):
-                    body.append(("valu", ("^", v_vals[b], v_vals[b], v_node_val_batch[b])))
-                
-                # Hash - interleave op1 and op3 for all batches
-                first_tmp_batch = first_tmps[:batches]
-                second_tmp_batch = second_tmps[:batches]
-                
-                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                    v_c1, v_c3 = v_hash_consts[hi * 2], v_hash_consts[hi * 2 + 1]
-                    # Interleave op1 and op3 emissions
-                    for b in range(batches):
-                        body.append(("valu", (op1, first_tmp_batch[b], v_vals[b], v_c1)))
-                        body.append(("valu", (op3, second_tmp_batch[b], v_vals[b], v_c3)))
-                    # Then op2
-                    for b in range(batches):
-                        body.append(("valu", (op2, v_vals[b], first_tmp_batch[b], second_tmp_batch[b])))
-                    
-                    for b in range(batches):
-                        for lane in range(VLEN):
-                            body.append(("debug", ("compare", v_vals[b] + lane, (round, offsets[b] + lane, "hash_stage", hi))))
-                
-                # Index computation
-                for b in range(batches):
-                    body.append(("valu", ("&", first_tmp_batch[b], v_vals[b], v_one)))
-                for b in range(batches):
-                    body.append(("valu", ("+", second_tmp_batch[b], first_tmp_batch[b], v_one)))
-                for b in range(batches):
-                    body.append(("valu", ("multiply_add", v_idxs[b], v_idxs[b], v_two, second_tmp_batch[b])))
-                
-                for b in range(batches):
-                    for lane in range(VLEN):
-                        body.append(("debug", ("compare", v_idxs[b] + lane, (round, offsets[b] + lane, "next_idx"))))
-                
-                for b in range(batches):
-                    body.append(("valu", ("<", first_tmp_batch[b], v_idxs[b], v_n_nodes)))
-                for b in range(batches):
-                    body.append(("valu", ("*", v_idxs[b], v_idxs[b], first_tmp_batch[b])))
-                
-                for b in range(batches):
-                    for lane in range(VLEN):
-                        body.append(("debug", ("compare", v_idxs[b] + lane, (round, offsets[b] + lane, "wrapped_idx"))))
-                        body.append(("debug", ("compare", v_vals[b] + lane, (round, offsets[b] + lane, "hashed_val"))))
-                
-                vec_i += batches
+                cur_node_vals = v_node_bufs[buf_sel][:batches]
+                first_tmps_batch = first_tmps[:batches]
+                second_tmps_batch = second_tmps[:batches]
 
+                debug_idx_val(round, offsets, v_idxs, v_vals)
+
+                if level == 0:
+                    self.instrs.extend(build_level0_cycles(cur_node_vals))
+                    debug_node_val(round, offsets, cur_node_vals)
+                    emit_hash_with_gather(round, offsets, v_idxs, v_vals, cur_node_vals, first_tmps_batch, second_tmps_batch, [])
+                elif level == 1:
+                    self.instrs.extend(build_level1_cycles(v_idxs, cur_node_vals, first_tmps_batch))
+                    debug_node_val(round, offsets, cur_node_vals)
+                    emit_hash_with_gather(round, offsets, v_idxs, v_vals, cur_node_vals, first_tmps_batch, second_tmps_batch, [])
+                else:
+                    debug_node_val(round, offsets, cur_node_vals)
+                    next_vec_i = vec_i + batches
+                    if next_vec_i < num_vectors:
+                        next_batches = min(6, num_vectors - next_vec_i)
+                        next_offsets = [next_vec_i * VLEN + i * VLEN for i in range(next_batches)]
+                        next_idxs = [v_idx_bank + o for o in next_offsets]
+                        next_node_vals = v_node_bufs[1 - buf_sel][:next_batches]
+                        gather_cycles = build_gather_cycles(next_idxs, next_node_vals)
+                    else:
+                        gather_cycles = []
+                    emit_hash_with_gather(round, offsets, v_idxs, v_vals, cur_node_vals, first_tmps_batch, second_tmps_batch, gather_cycles)
+
+                vec_i += batches
+                buf_sel = 1 - buf_sel
+
+        final_body = []
         for vec_i in range(num_vectors):
             offset_const = offset_consts[vec_i]
-            body.append(("alu", ("+", base_addr_A, self.scratch["inp_indices_p"], offset_const)))
-            body.append(("store", ("vstore", base_addr_A, v_idx_bank + vec_i * VLEN)))
-            body.append(("alu", ("+", base_addr_A, self.scratch["inp_values_p"], offset_const)))
-            body.append(("store", ("vstore", base_addr_A, v_val_bank + vec_i * VLEN)))
+            final_body.append(("alu", ("+", base_addr_A, self.scratch["inp_indices_p"], offset_const)))
+            final_body.append(("store", ("vstore", base_addr_A, v_idx_bank + vec_i * VLEN)))
+            final_body.append(("alu", ("+", base_addr_A, self.scratch["inp_values_p"], offset_const)))
+            final_body.append(("store", ("vstore", base_addr_A, v_val_bank + vec_i * VLEN)))
 
-        self.instrs.extend(self.build(body, vliw=True))
+        self.instrs.extend(self.build(final_body, vliw=True))
         self.instrs.append({"flow": [("pause",)]})
 
     def build_kernel(self, forest_height, n_nodes, batch_size, rounds):
