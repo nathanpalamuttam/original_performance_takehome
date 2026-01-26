@@ -123,6 +123,14 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
+    def scratch_const_deferred(self, val, deferred_list, name=None):
+        """Like scratch_const but adds to deferred_list instead of self.instrs"""
+        if val not in self.const_map:
+            addr = self.alloc_scratch(name)
+            deferred_list.append(("load", ("const", addr, val)))
+            self.const_map[val] = addr
+        return self.const_map[val]
+
     def build_kernel_pipelined(self, forest_height, n_nodes, batch_size, rounds):
         tmp1 = self.alloc_scratch("tmp1")
         for v in ["rounds", "n_nodes", "batch_size", "forest_height", "forest_values_p", "inp_indices_p", "inp_values_p"]:
@@ -131,8 +139,11 @@ class KernelBuilder:
             self.add("load", ("const", tmp1, i))
             self.add("load", ("load", self.scratch[v], tmp1))
 
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        # Collect all const loads in init_body for better packing
+        init_body = []
+        
+        one_const = self.scratch_const_deferred(1, init_body)
+        two_const = self.scratch_const_deferred(2, init_body)
         self.add("flow", ("pause",))
 
         num_vectors = batch_size // VLEN
@@ -153,7 +164,6 @@ class KernelBuilder:
         node_addr_tmp4 = self.alloc_scratch("node_addr_tmp4")
         v_one, v_two, v_n_nodes = [self.alloc_scratch(n, VLEN) for n in ["v_one", "v_two", "v_n_nodes"]]
 
-        init_body = []
         init_body.append(("valu", ("vbroadcast", v_one, one_const)))
         init_body.append(("valu", ("vbroadcast", v_two, two_const)))
         init_body.append(("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"])))
@@ -162,8 +172,8 @@ class KernelBuilder:
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             v_val1 = self.alloc_scratch(f"v_hash_c1_{hi}", VLEN)
             v_val3 = self.alloc_scratch(f"v_hash_c3_{hi}", VLEN)
-            init_body.append(("valu", ("vbroadcast", v_val1, self.scratch_const(val1))))
-            init_body.append(("valu", ("vbroadcast", v_val3, self.scratch_const(val3))))
+            init_body.append(("valu", ("vbroadcast", v_val1, self.scratch_const_deferred(val1, init_body))))
+            init_body.append(("valu", ("vbroadcast", v_val3, self.scratch_const_deferred(val3, init_body))))
             v_hash_consts.extend([v_val1, v_val3])
 
         v_root, v_node1, v_node2 = [self.alloc_scratch(n, VLEN) for n in ["v_root", "v_node1", "v_node2"]]
@@ -179,7 +189,7 @@ class KernelBuilder:
         init_body.append(("valu", ("vbroadcast", v_node2, tmp1)))
         init_body.append(("valu", ("-", v_node1_minus_node2, v_node1, v_node2)))
 
-        offset_consts = [self.scratch_const(vec_i * VLEN) for vec_i in range(num_vectors)]
+        offset_consts = [self.scratch_const_deferred(vec_i * VLEN, init_body) for vec_i in range(num_vectors)]
 
         for vec_i in range(num_vectors):
             offset_const = offset_consts[vec_i]
@@ -369,12 +379,18 @@ class KernelBuilder:
                 self.instrs.append(gather_cycles[g_idx])
                 g_idx += 1
 
+        prolog_emitted_for_next = {}  # Track which rounds had their prolog emitted by prev round
+        
         for round in range(rounds):
             level = round % (forest_height + 1)
+            next_level = (round + 1) % (forest_height + 1) if round + 1 < rounds else -1
             vec_i = 0
             buf_sel = 0
+            
+            # Prolog was emitted by previous round if we recorded it
+            prolog_already_done = prolog_emitted_for_next.get(round, False)
 
-            if level >= 2 and num_vectors:
+            if level >= 2 and num_vectors and not prolog_already_done:
                 batches = min(6, num_vectors)
                 v_idxs0 = [v_idx_bank + i * VLEN for i in range(batches)]
                 v_node_vals0 = v_node_bufs[buf_sel][:batches]
@@ -394,11 +410,33 @@ class KernelBuilder:
                 if level == 0:
                     self.instrs.extend(build_level0_cycles(cur_node_vals))
                     debug_node_val(round, offsets, cur_node_vals)
-                    emit_hash_with_gather(round, offsets, v_idxs, v_vals, cur_node_vals, first_tmps_batch, second_tmps_batch, [])
+                    # For last batch, check if we can overlap with next round's prolog
+                    next_vec_i = vec_i + batches
+                    if next_vec_i >= num_vectors and next_level >= 2:
+                        # Overlap with next round's prolog gather
+                        next_batches = min(6, num_vectors)
+                        next_idxs = [v_idx_bank + i * VLEN for i in range(next_batches)]
+                        # Use the OTHER buffer for next round's first batch
+                        next_node_vals = v_node_bufs[1 - buf_sel][:next_batches]
+                        gather_cycles = build_gather_cycles(next_idxs, next_node_vals)
+                        prolog_emitted_for_next[round + 1] = True
+                    else:
+                        gather_cycles = []
+                    emit_hash_with_gather(round, offsets, v_idxs, v_vals, cur_node_vals, first_tmps_batch, second_tmps_batch, gather_cycles)
                 elif level == 1:
                     self.instrs.extend(build_level1_cycles(v_idxs, cur_node_vals, first_tmps_batch))
                     debug_node_val(round, offsets, cur_node_vals)
-                    emit_hash_with_gather(round, offsets, v_idxs, v_vals, cur_node_vals, first_tmps_batch, second_tmps_batch, [])
+                    # For last batch, check if we can overlap with next round's prolog
+                    next_vec_i = vec_i + batches
+                    if next_vec_i >= num_vectors and next_level >= 2:
+                        next_batches = min(6, num_vectors)
+                        next_idxs = [v_idx_bank + i * VLEN for i in range(next_batches)]
+                        next_node_vals = v_node_bufs[1 - buf_sel][:next_batches]
+                        gather_cycles = build_gather_cycles(next_idxs, next_node_vals)
+                        prolog_emitted_for_next[round + 1] = True
+                    else:
+                        gather_cycles = []
+                    emit_hash_with_gather(round, offsets, v_idxs, v_vals, cur_node_vals, first_tmps_batch, second_tmps_batch, gather_cycles)
                 else:
                     debug_node_val(round, offsets, cur_node_vals)
                     next_vec_i = vec_i + batches
@@ -408,6 +446,14 @@ class KernelBuilder:
                         next_idxs = [v_idx_bank + o for o in next_offsets]
                         next_node_vals = v_node_bufs[1 - buf_sel][:next_batches]
                         gather_cycles = build_gather_cycles(next_idxs, next_node_vals)
+                    elif next_level >= 2:
+                        # Last batch of this round, next round is also gather
+                        # Overlap with next round's prolog
+                        next_batches = min(6, num_vectors)
+                        next_idxs = [v_idx_bank + i * VLEN for i in range(next_batches)]
+                        next_node_vals = v_node_bufs[1 - buf_sel][:next_batches]
+                        gather_cycles = build_gather_cycles(next_idxs, next_node_vals)
+                        prolog_emitted_for_next[round + 1] = True
                     else:
                         gather_cycles = []
                     emit_hash_with_gather(round, offsets, v_idxs, v_vals, cur_node_vals, first_tmps_batch, second_tmps_batch, gather_cycles)
