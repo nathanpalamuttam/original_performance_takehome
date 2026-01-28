@@ -145,10 +145,26 @@ class KernelBuilder:
         v_idx_bank = self.alloc_scratch("v_idx_bank", num_vectors * VLEN)
         v_val_bank = self.alloc_scratch("v_val_bank", num_vectors * VLEN)
 
-        window_vectors = num_vectors if num_vectors <= 4 else (num_vectors - 4)
-        v_node_bank = self.alloc_scratch("v_node_bank", window_vectors * VLEN)
-        tmpA_bank = self.alloc_scratch("v_tmp1_bank", window_vectors * VLEN)
-        tmpB_bank = self.alloc_scratch("v_tmp2_bank", window_vectors * VLEN)
+        # Size the interleave window for a 2-window pipeline to fit within remaining scratch.
+        future_fixed = (
+            3  # base_addr_A + store_addr0 + store_addr1
+            + 32  # addr_fifo
+            + 4 * VLEN  # v_one/v_two/v_n_nodes/v_three
+            + 12 * VLEN  # v_hash_consts (6 stages * 2)
+            + 3 * VLEN  # v_root/v_node1/v_node2
+            + VLEN  # v_node1_minus_node2
+            + 4 * VLEN  # v_node3..v_node6
+            + VLEN  # v_node4_minus_node3
+            + VLEN  # v_node6_minus_node5
+            + num_vectors  # offset_consts
+        )
+        remaining = SCRATCH_SIZE - self.scratch_ptr - future_fixed
+        max_window = max(1, remaining // (2 * 3 * VLEN))
+        window_vectors = min(num_vectors, max_window)
+        bank_stride = window_vectors * VLEN
+        v_node_bank = self.alloc_scratch("v_node_bank", 2 * bank_stride)
+        tmpA_bank = self.alloc_scratch("v_tmp1_bank", 2 * bank_stride)
+        tmpB_bank = self.alloc_scratch("v_tmp2_bank", 2 * bank_stride)
 
         base_addr_A = self.alloc_scratch("base_addr_A")
         store_addr0 = self.alloc_scratch("store_addr0")
@@ -227,8 +243,8 @@ class KernelBuilder:
         addr_ready = []
 
         # Track pending loads per batch (overlap load/compute within group)
-        batch_pending = []
-        batches_ref = []
+        batch_pending = {}
+        batches_ref = {}
 
         # Store pipeline (we will ONLY store values at end; no idx stores)
         store_queue = []
@@ -264,7 +280,7 @@ class KernelBuilder:
                 fifo_idx, dest_reg, batch_id = addr_ready.pop(0)
                 load_slots.append(("load", dest_reg, addr_fifo_base + fifo_idx))
                 batch_pending[batch_id] -= 1
-                if batch_pending[batch_id] == 0 and batches_ref:
+                if batch_pending[batch_id] == 0 and batch_id in batches_ref:
                     batches_ref[batch_id]["ready"] = True
                 addr_count -= 1
                 cap -= 1
@@ -388,172 +404,194 @@ class KernelBuilder:
             nonlocal store_enabled
 
             store_enabled = True
+            next_vi = 0
+            next_batch_id = 0
+            windows = [None, None]
 
-            def run_window(active_vecs):
-                nonlocal batch_pending, batches_ref
-                batches = []
-                for slot, vi in enumerate(active_vecs):
-                    off = vi * VLEN
-                    buf_off = slot * VLEN
-                    batches.append(
-                        {
-                            "id": slot,
-                            "vi": vi,
-                            "v_idx": v_idx_bank + off,
-                            "v_val": v_val_bank + off,
-                            "v_node": v_node_bank + buf_off,
-                            "tmpA": tmpA_bank + buf_off,
-                            "tmpB": tmpB_bank + buf_off,
-                            "round": 0,
-                            "level": 0,
-                            "state": 0,
-                            "ready": True,
-                            "val_q": False,
-                            "done": False,
-                        }
-                    )
+            def start_round(b):
+                b["level"] = b["round"] % (forest_height + 1)
+                b["state"] = start_state(b["level"])
+                b["val_q"] = False
+                if b["level"] >= 3:
+                    b["ready"] = False
+                    enqueue_gather([b["v_idx"]], [b["v_node"]], [b["id"]])
+                else:
+                    b["ready"] = True
 
-                if not batches:
+            def init_window(slot_id):
+                nonlocal next_vi, next_batch_id
+                if next_vi >= num_vectors:
+                    windows[slot_id] = None
                     return
-                batch_pending = [0] * len(batches)
-                batches_ref = batches
-
-                def start_round(b):
-                    b["level"] = b["round"] % (forest_height + 1)
-                    b["state"] = start_state(b["level"])
-                    b["val_q"] = False
-                    if b["level"] >= 3:
-                        b["ready"] = False
-                        enqueue_gather([b["v_idx"]], [b["v_node"]], [b["id"]])
-                    else:
-                        b["ready"] = True
-
+                vecs = list(range(next_vi, min(next_vi + window_vectors, num_vectors)))
+                next_vi = vecs[-1] + 1
+                base = slot_id * bank_stride
+                batches = []
+                for slot, vi in enumerate(vecs):
+                    off = vi * VLEN
+                    buf_off = base + slot * VLEN
+                    batch_id = next_batch_id
+                    next_batch_id += 1
+                    b = {
+                        "id": batch_id,
+                        "vi": vi,
+                        "v_idx": v_idx_bank + off,
+                        "v_val": v_val_bank + off,
+                        "v_node": v_node_bank + buf_off,
+                        "tmpA": tmpA_bank + buf_off,
+                        "tmpB": tmpB_bank + buf_off,
+                        "round": 0,
+                        "level": 0,
+                        "state": 0,
+                        "ready": True,
+                        "val_q": False,
+                        "done": False,
+                    }
+                    batches.append(b)
+                    batches_ref[batch_id] = b
                 for b in batches:
                     start_round(b)
+                windows[slot_id] = {"batches": batches}
 
-                while any(not b["done"] for b in batches):
-                    valu_slots = []
-                    valu_cap = SLOT_LIMITS["valu"]
-                    valu_only = []
-                    offloadable = []
+            def all_batches():
+                bs = []
+                for w in windows:
+                    if w:
+                        bs.extend(w["batches"])
+                return bs
 
-                    for b in batches:
-                        if b["done"] or b["state"] == 24:
-                            continue
-                        if b["state"] == 0 and b["level"] >= 3 and (not b["ready"]):
-                            continue
+            init_window(0)
+            init_window(1)
 
-                        last_round = (b["round"] == rounds - 1)
-                        idx_mode = "skip" if last_round else ("depth0" if b["level"] == 0 else "full")
-                        wrap = (b["level"] == forest_height)
-                        node_src = v_root if b["level"] == 0 else b["v_node"]
+            while any(windows):
+                batches = all_batches()
+                valu_slots = []
+                valu_cap = SLOT_LIMITS["valu"]
+                valu_only = []
+                offloadable = []
 
-                        if b["state"] < 0:
-                            op, nxt = get_pre_op(b["level"], b["state"], b["v_idx"], b["v_node"], b["tmpA"], b["tmpB"])
+                for b in batches:
+                    if b["done"] or b["state"] == 24:
+                        continue
+                    if b["state"] == 0 and b["level"] >= 3 and (not b["ready"]):
+                        continue
+
+                    last_round = (b["round"] == rounds - 1)
+                    idx_mode = "skip" if last_round else ("depth0" if b["level"] == 0 else "full")
+                    wrap = (b["level"] == forest_height)
+                    node_src = v_root if b["level"] == 0 else b["v_node"]
+
+                    if b["state"] < 0:
+                        op, nxt = get_pre_op(b["level"], b["state"], b["v_idx"], b["v_node"], b["tmpA"], b["tmpB"])
+                        valu_only.append((b, op, nxt, last_round))
+                    elif 1 <= b["state"] <= 18:
+                        vop, aops, nxt = get_hash_ops(b["state"], b["v_val"], b["tmpA"], b["tmpB"])
+                        if aops is not None:
+                            offloadable.append((b, vop, aops, nxt, last_round))
+                        else:
+                            valu_only.append((b, vop, nxt, last_round))
+                    else:
+                        op, nxt = get_op(
+                            b["state"], b["v_val"], b["v_idx"], node_src, b["tmpA"], b["tmpB"], idx_mode, wrap
+                        )
+                        if op is not None and b["state"] >= 19 and op[0] != "multiply_add":
+                            aops = emit_alu_lane_op_mixed(op[0], op[1], op[2], op[3])
+                            offloadable.append((b, op, aops, nxt, last_round))
+                        else:
                             valu_only.append((b, op, nxt, last_round))
-                        elif 1 <= b["state"] <= 18:
-                            vop, aops, nxt = get_hash_ops(b["state"], b["v_val"], b["tmpA"], b["tmpB"])
-                            if aops is not None:
-                                offloadable.append((b, vop, aops, nxt, last_round))
-                            else:
-                                valu_only.append((b, vop, nxt, last_round))
-                        else:
-                            op, nxt = get_op(
-                                b["state"], b["v_val"], b["v_idx"], node_src, b["tmpA"], b["tmpB"], idx_mode, wrap
-                            )
-                            if op is not None and b["state"] >= 19 and op[0] != "multiply_add":
-                                aops = emit_alu_lane_op_mixed(op[0], op[1], op[2], op[3])
-                                offloadable.append((b, op, aops, nxt, last_round))
-                            else:
-                                valu_only.append((b, op, nxt, last_round))
 
-                    scheduled = set()
+                scheduled = set()
 
-                    def mark_progress(b, old, nxt, last_round):
-                        b["state"] = nxt
-                        scheduled.add(id(b))
-                        if last_round and (old < 19 <= nxt) and (not b["val_q"]):
-                            store_queue.append(b["vi"])
-                            b["val_q"] = True
+                def mark_progress(b, old, nxt, last_round):
+                    b["state"] = nxt
+                    scheduled.add(id(b))
+                    if last_round and (old < 19 <= nxt) and (not b["val_q"]):
+                        store_queue.append(b["vi"])
+                        b["val_q"] = True
 
+                cycle = {}
+                alu_slots = cycle.setdefault("alu", [])
+                load_slots = cycle.setdefault("load", [])
+
+                reserve_hash = VLEN if offloadable else 0
+                do_gather_alu(alu_slots, max_slots=SLOT_LIMITS["alu"] - reserve_hash)
+                do_gather_load(load_slots)
+                do_store(cycle)
+                alu_cap = SLOT_LIMITS["alu"] - len(alu_slots)
+
+                for b, vop, aops, nxt, last_round in offloadable:
+                    if alu_cap < VLEN:
+                        break
+                    old = b["state"]
+                    alu_slots.extend(aops)
+                    alu_cap -= VLEN
+                    mark_progress(b, old, nxt, last_round)
+
+                # Schedule VALU ops (including fallback for hash const ops not offloaded).
+                for b, op, nxt, last_round in valu_only:
+                    if valu_cap <= 0:
+                        break
+                    if id(b) in scheduled:
+                        continue
+                    old = b["state"]
+                    if 1 <= old <= 18 and (old - 1) % 3 == 0 and valu_cap >= 2:
+                        op1, op3, nxt2 = get_hash_pair(old, b["v_val"], b["tmpA"], b["tmpB"])
+                        if op1 is not None and op3 is not None:
+                            valu_slots.extend([op1, op3])
+                            valu_cap -= 2
+                            mark_progress(b, old, nxt2, last_round)
+                            continue
+                    if op is not None:
+                        valu_slots.append(op)
+                        valu_cap -= 1
+                    mark_progress(b, old, nxt, last_round)
+
+                for b, vop, aops, nxt, last_round in offloadable:
+                    if valu_cap <= 0:
+                        break
+                    if id(b) in scheduled:
+                        continue
+                    old = b["state"]
+                    if 1 <= old <= 18 and (old - 1) % 3 == 0 and valu_cap >= 2:
+                        op1, op3, nxt2 = get_hash_pair(old, b["v_val"], b["tmpA"], b["tmpB"])
+                        if op1 is not None and op3 is not None:
+                            valu_slots.extend([op1, op3])
+                            valu_cap -= 2
+                            mark_progress(b, old, nxt2, last_round)
+                            continue
+                    if vop is not None:
+                        valu_slots.append(vop)
+                        valu_cap -= 1
+                    mark_progress(b, old, nxt, last_round)
+
+                if valu_slots:
+                    cycle["valu"] = valu_slots
+                if not alu_slots:
+                    del cycle["alu"]
+                if not load_slots:
+                    del cycle["load"]
+                if "valu" not in cycle and not cycle:
                     cycle = {}
-                    alu_slots = cycle.setdefault("alu", [])
-                    load_slots = cycle.setdefault("load", [])
+                self.instrs.append(cycle)
+                end_cycle()
 
-                    reserve_hash = VLEN if offloadable else 0
-                    do_gather_alu(alu_slots, max_slots=SLOT_LIMITS["alu"] - reserve_hash)
-                    do_gather_load(load_slots)
-                    do_store(cycle)
-                    alu_cap = SLOT_LIMITS["alu"] - len(alu_slots)
+                for b in batches:
+                    if b["done"] or b["state"] != 24:
+                        continue
+                    if b["round"] == rounds - 1:
+                        b["done"] = True
+                    else:
+                        b["round"] += 1
+                        start_round(b)
 
-                    for b, vop, aops, nxt, last_round in offloadable:
-                        if alu_cap < VLEN:
-                            break
-                        old = b["state"]
-                        alu_slots.extend(aops)
-                        alu_cap -= VLEN
-                        mark_progress(b, old, nxt, last_round)
-
-                    # Schedule VALU ops (including fallback for hash const ops not offloaded).
-                    for b, op, nxt, last_round in valu_only:
-                        if valu_cap <= 0:
-                            break
-                        if id(b) in scheduled:
-                            continue
-                        old = b["state"]
-                        if 1 <= old <= 18 and (old - 1) % 3 == 0 and valu_cap >= 2:
-                            op1, op3, nxt2 = get_hash_pair(old, b["v_val"], b["tmpA"], b["tmpB"])
-                            if op1 is not None and op3 is not None:
-                                valu_slots.extend([op1, op3])
-                                valu_cap -= 2
-                                mark_progress(b, old, nxt2, last_round)
-                                continue
-                        if op is not None:
-                            valu_slots.append(op)
-                            valu_cap -= 1
-                        mark_progress(b, old, nxt, last_round)
-
-                    for b, vop, aops, nxt, last_round in offloadable:
-                        if valu_cap <= 0:
-                            break
-                        if id(b) in scheduled:
-                            continue
-                        old = b["state"]
-                        if 1 <= old <= 18 and (old - 1) % 3 == 0 and valu_cap >= 2:
-                            op1, op3, nxt2 = get_hash_pair(old, b["v_val"], b["tmpA"], b["tmpB"])
-                            if op1 is not None and op3 is not None:
-                                valu_slots.extend([op1, op3])
-                                valu_cap -= 2
-                                mark_progress(b, old, nxt2, last_round)
-                                continue
-                        if vop is not None:
-                            valu_slots.append(vop)
-                            valu_cap -= 1
-                        mark_progress(b, old, nxt, last_round)
-
-                    if valu_slots:
-                        cycle["valu"] = valu_slots
-                    if not alu_slots:
-                        del cycle["alu"]
-                    if not load_slots:
-                        del cycle["load"]
-                    if "valu" not in cycle and not cycle:
-                        cycle = {}
-                    self.instrs.append(cycle)
-                    end_cycle()
-
-                    for b in batches:
-                        if b["done"] or b["state"] != 24:
-                            continue
-                        if b["round"] == rounds - 1:
-                            b["done"] = True
-                        else:
-                            b["round"] += 1
-                            start_round(b)
-
-            for win_start in range(0, num_vectors, window_vectors):
-                win_vecs = list(range(win_start, min(win_start + window_vectors, num_vectors)))
-                run_window(win_vecs)
+                for i, w in enumerate(windows):
+                    if not w:
+                        continue
+                    if all(b["done"] for b in w["batches"]):
+                        for b in w["batches"]:
+                            batches_ref.pop(b["id"], None)
+                            batch_pending.pop(b["id"], None)
+                        init_window(i)
 
         # ---------------- Main loop ----------------
         run_interleaved()
