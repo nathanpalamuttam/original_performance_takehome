@@ -136,6 +136,8 @@ class KernelBuilder:
             header_body.append(("load", ("load", self.scratch[v], header_temps[i])))
         
         # Build with VLIW scheduling - this will pack loads efficiently
+        # Add pause to header_body so it can be packed with the last load cycle
+        header_body.append(("flow", ("pause",)))
         self.instrs.extend(self.build(header_body, vliw=True))
 
         init_body = []
@@ -145,7 +147,6 @@ class KernelBuilder:
         four_const = self.scratch_const_deferred(4, init_body)
         five_const = self.scratch_const_deferred(5, init_body)
         six_const = self.scratch_const_deferred(6, init_body)
-        self.add("flow", ("pause",))
 
         num_vectors = batch_size // VLEN
         v_idx_bank = self.alloc_scratch("v_idx_bank", num_vectors * VLEN)
@@ -420,7 +421,12 @@ class KernelBuilder:
                 return (op1, tmpA, v_val, c1_vec), emit_alu_lane_op(op1, tmpA, v_val, c1_s), state + 1
             if sub == 1:
                 return (op3, tmpB, v_val, c3_vec), emit_alu_lane_op(op3, tmpB, v_val, c3_s), state + 1
-            return (op2, v_val, tmpA, tmpB), None, (1 + (hi + 1) * 3 if hi < 5 else 19)
+            # op2 can also be offloaded to scalar ALU lanes when capacity allows
+            return (
+                (op2, v_val, tmpA, tmpB),
+                emit_alu_lane_op_mixed(op2, v_val, tmpA, tmpB),
+                (1 + (hi + 1) * 3 if hi < 5 else 19),
+            )
 
         def get_hash_pair(state, v_val, tmpA, tmpB):
             # Allow op1/op3 in the same cycle when VALU has room (independent reads of v_val).
