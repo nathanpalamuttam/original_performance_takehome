@@ -190,15 +190,35 @@ class KernelBuilder:
 
         v_hash_consts = []
         hash_const_addrs = []
+        v_hash_multipliers = []  # For fusable stages: multiplier = 1 + 2^shift
+        hash_fusable = []  # Track which stages can be fused
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            # Check if stage is fusable: (a + c1) + (a << c3) = a * (1 + 2^c3) + c1
+            fusable = (op1 == "+" and op2 == "+" and op3 == "<<")
+            hash_fusable.append(fusable)
+            
             v_val1 = self.alloc_scratch(f"v_hash_c1_{hi}", VLEN)
-            v_val3 = self.alloc_scratch(f"v_hash_c3_{hi}", VLEN)
             c1_addr = self.scratch_const_deferred(val1, init_body)
-            c3_addr = self.scratch_const_deferred(val3, init_body)
             init_body.append(("valu", ("vbroadcast", v_val1, c1_addr)))
-            init_body.append(("valu", ("vbroadcast", v_val3, c3_addr)))
-            v_hash_consts.extend([v_val1, v_val3])
-            hash_const_addrs.append((c1_addr, c3_addr))
+            
+            if fusable:
+                # For fusable stages, use multiplier vector instead of shift vector
+                multiplier = 1 + (1 << val3)
+                v_mult = self.alloc_scratch(f"v_hash_mult_{hi}", VLEN)
+                mult_addr = self.scratch_const_deferred(multiplier, init_body)
+                init_body.append(("valu", ("vbroadcast", v_mult, mult_addr)))
+                v_hash_consts.extend([v_val1, v_mult])  # Store multiplier in second slot
+                hash_const_addrs.append((c1_addr, mult_addr))
+                v_hash_multipliers.append(v_mult)
+            else:
+                # For non-fusable stages, keep the shift constant
+                v_val3 = self.alloc_scratch(f"v_hash_c3_{hi}", VLEN)
+                c3_addr = self.scratch_const_deferred(val3, init_body)
+                init_body.append(("valu", ("vbroadcast", v_val3, c3_addr)))
+                v_hash_consts.extend([v_val1, v_val3])
+                hash_const_addrs.append((c1_addr, c3_addr))
+                v_hash_multipliers.append(None)
+                
         vec_const_map = {
             v_one: one_const,
             v_two: two_const,
@@ -385,6 +405,17 @@ class KernelBuilder:
             op1, _, op2, op3, _ = HASH_STAGES[hi]
             c1_vec, c3_vec = v_hash_consts[hi * 2], v_hash_consts[hi * 2 + 1]
             c1_s, c3_s = hash_const_addrs[hi]
+            
+            # For fusable stages (op1=+, op2=+, op3=<<), use single multiply_add
+            if hash_fusable[hi]:
+                if sub == 0:
+                    # Fuse entire stage: v_val = v_val * multiplier + c1
+                    v_mult = v_hash_multipliers[hi]
+                    return ("multiply_add", v_val, v_val, v_mult, c1_vec), None, (1 + (hi + 1) * 3 if hi < 5 else 19)
+                # sub 1 and 2 are skipped for fusable stages
+                return None, None, (1 + (hi + 1) * 3 if hi < 5 else 19)
+            
+            # Non-fusable stages use original 3-op pattern
             if sub == 0:
                 return (op1, tmpA, v_val, c1_vec), emit_alu_lane_op(op1, tmpA, v_val, c1_s), state + 1
             if sub == 1:
@@ -395,6 +426,9 @@ class KernelBuilder:
             # Allow op1/op3 in the same cycle when VALU has room (independent reads of v_val).
             hi, sub = (state - 1) // 3, (state - 1) % 3
             if sub != 0:
+                return None, None, None
+            # For fusable stages, we don't need the pair optimization
+            if hash_fusable[hi]:
                 return None, None, None
             op1, _, _, op3, _ = HASH_STAGES[hi]
             c1, c3 = v_hash_consts[hi * 2], v_hash_consts[hi * 2 + 1]
