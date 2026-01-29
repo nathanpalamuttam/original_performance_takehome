@@ -108,7 +108,9 @@ class KernelBuilder:
     def build_kernel_pipelined(self, forest_height, n_nodes, batch_size, rounds):
         batch_group = 6
         tmp1 = self.alloc_scratch("tmp1")
-        for v in [
+        
+        # Allocate header variables
+        header_vars = [
             "rounds",
             "n_nodes",
             "batch_size",
@@ -116,21 +118,25 @@ class KernelBuilder:
             "forest_values_p",
             "inp_indices_p",
             "inp_values_p",
-        ]:
+        ]
+        for v in header_vars:
             self.alloc_scratch(v, 1)
-        for i, v in enumerate(
-            [
-                "rounds",
-                "n_nodes",
-                "batch_size",
-                "forest_height",
-                "forest_values_p",
-                "inp_indices_p",
-                "inp_values_p",
-            ]
-        ):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+        
+        # FIX: Use deferred building with separate temp registers to enable VLIW packing
+        # Instead of reusing tmp1 (which creates dependencies), use separate temps
+        header_body = []
+        header_temps = [self.alloc_scratch(f"tmp_h{i}") for i in range(len(header_vars))]
+        
+        # First, emit all const ops (these can be packed)
+        for i in range(len(header_vars)):
+            header_body.append(("load", ("const", header_temps[i], i)))
+        
+        # Then emit all load ops (these depend on the consts, but can be packed together)
+        for i, v in enumerate(header_vars):
+            header_body.append(("load", ("load", self.scratch[v], header_temps[i])))
+        
+        # Build with VLIW scheduling - this will pack loads efficiently
+        self.instrs.extend(self.build(header_body, vliw=True))
 
         init_body = []
         one_const = self.scratch_const_deferred(1, init_body)
@@ -145,10 +151,11 @@ class KernelBuilder:
         v_idx_bank = self.alloc_scratch("v_idx_bank", num_vectors * VLEN)
         v_val_bank = self.alloc_scratch("v_val_bank", num_vectors * VLEN)
 
+        addr_fifo_size = 64
         # Size the interleave window for a 2-window pipeline to fit within remaining scratch.
         future_fixed = (
             3  # base_addr_A + store_addr0 + store_addr1
-            + 32  # addr_fifo
+            + addr_fifo_size  # addr_fifo
             + 4 * VLEN  # v_one/v_two/v_n_nodes/v_three
             + 12 * VLEN  # v_hash_consts (6 stages * 2)
             + 3 * VLEN  # v_root/v_node1/v_node2
@@ -170,7 +177,6 @@ class KernelBuilder:
         store_addr0 = self.alloc_scratch("store_addr0")
         store_addr1 = self.alloc_scratch("store_addr1")
 
-        addr_fifo_size = 32
         addr_fifo_base = self.alloc_scratch("addr_fifo", addr_fifo_size)
 
         v_one, v_two, v_n_nodes, v_three = [
@@ -209,30 +215,56 @@ class KernelBuilder:
         v_node4_minus_node3 = self.alloc_scratch("v_node4_minus_node3", VLEN)
         v_node6_minus_node5 = self.alloc_scratch("v_node6_minus_node5", VLEN)
 
+        # Allocate second address register and temp for pipelined loading
+        base_addr_B = self.alloc_scratch("base_addr_B")
+        tmp2 = self.alloc_scratch("tmp2")
+
+        # Load root node
         init_body.append(("load", ("load", tmp1, self.scratch["forest_values_p"])))
         init_body.append(("valu", ("vbroadcast", v_root, tmp1)))
-        for const, node in [
-            (one_const, v_node1),
-            (two_const, v_node2),
-            (three_const, v_node3),
-            (four_const, v_node4),
-            (five_const, v_node5),
-            (six_const, v_node6),
-        ]:
-            init_body.append(("alu", ("+", base_addr_A, self.scratch["forest_values_p"], const)))
+        
+        # Load nodes 1-6 with pipelining: process in pairs
+        node_pairs = [
+            ((one_const, v_node1), (two_const, v_node2)),
+            ((three_const, v_node3), (four_const, v_node4)),
+            ((five_const, v_node5), (six_const, v_node6)),
+        ]
+        for (const_a, node_a), (const_b, node_b) in node_pairs:
+            # Emit pair of ALUs
+            init_body.append(("alu", ("+", base_addr_A, self.scratch["forest_values_p"], const_a)))
+            init_body.append(("alu", ("+", base_addr_B, self.scratch["forest_values_p"], const_b)))
+            # Emit pair of loads
             init_body.append(("load", ("load", tmp1, base_addr_A)))
-            init_body.append(("valu", ("vbroadcast", node, tmp1)))
+            init_body.append(("load", ("load", tmp2, base_addr_B)))
+            # Emit pair of broadcasts
+            init_body.append(("valu", ("vbroadcast", node_a, tmp1)))
+            init_body.append(("valu", ("vbroadcast", node_b, tmp2)))
+        
         init_body.append(("valu", ("-", v_node1_minus_node2, v_node1, v_node2)))
         init_body.append(("valu", ("-", v_node4_minus_node3, v_node4, v_node3)))
         init_body.append(("valu", ("-", v_node6_minus_node5, v_node6, v_node5)))
 
-        # Load initial idx/val vectors
+        # Load initial idx/val vectors - restructured for better VLIW pipelining
+        # Pattern: (alu A, alu B, load A, load B) repeated allows pipelining
         offset_consts = [self.scratch_const_deferred(vec_i * VLEN, init_body) for vec_i in range(num_vectors)]
-        for vec_i in range(num_vectors):
-            init_body.append(("alu", ("+", base_addr_A, self.scratch["inp_indices_p"], offset_consts[vec_i])))
-            init_body.append(("load", ("vload", v_idx_bank + vec_i * VLEN, base_addr_A)))
-            init_body.append(("alu", ("+", base_addr_A, self.scratch["inp_values_p"], offset_consts[vec_i])))
-            init_body.append(("load", ("vload", v_val_bank + vec_i * VLEN, base_addr_A)))
+        
+        # Process idx vectors in pairs for pipelining
+        for i in range(0, num_vectors, 2):
+            init_body.append(("alu", ("+", base_addr_A, self.scratch["inp_indices_p"], offset_consts[i])))
+            if i + 1 < num_vectors:
+                init_body.append(("alu", ("+", base_addr_B, self.scratch["inp_indices_p"], offset_consts[i + 1])))
+            init_body.append(("load", ("vload", v_idx_bank + i * VLEN, base_addr_A)))
+            if i + 1 < num_vectors:
+                init_body.append(("load", ("vload", v_idx_bank + (i + 1) * VLEN, base_addr_B)))
+        
+        # Process val vectors in pairs for pipelining
+        for i in range(0, num_vectors, 2):
+            init_body.append(("alu", ("+", base_addr_A, self.scratch["inp_values_p"], offset_consts[i])))
+            if i + 1 < num_vectors:
+                init_body.append(("alu", ("+", base_addr_B, self.scratch["inp_values_p"], offset_consts[i + 1])))
+            init_body.append(("load", ("vload", v_val_bank + i * VLEN, base_addr_A)))
+            if i + 1 < num_vectors:
+                init_body.append(("load", ("vload", v_val_bank + (i + 1) * VLEN, base_addr_B)))
         self.instrs.extend(self.build(init_body, vliw=True))
 
         # ---------------- Infrastructure state ----------------
@@ -494,7 +526,11 @@ class KernelBuilder:
                         op, nxt = get_op(
                             b["state"], b["v_val"], b["v_idx"], node_src, b["tmpA"], b["tmpB"], idx_mode, wrap
                         )
-                        if op is not None and b["state"] >= 19 and op[0] != "multiply_add":
+                        allow_offload = (
+                            (b["state"] >= 19 and op is not None and op[0] != "multiply_add")
+                            or (b["state"] == 0 and op is not None and op[0] == "^")
+                        )
+                        if allow_offload:
                             aops = emit_alu_lane_op_mixed(op[0], op[1], op[2], op[3])
                             offloadable.append((b, op, aops, nxt, last_round))
                         else:
@@ -581,6 +617,7 @@ class KernelBuilder:
                     if b["round"] == rounds - 1:
                         b["done"] = True
                     else:
+                        # Fallback if a batch somehow reached 24 without advance.
                         b["round"] += 1
                         start_round(b)
 
