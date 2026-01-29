@@ -1,6 +1,19 @@
 """
 # Anthropic's Original Performance Engineering Take-home (Release version)
-Copyright Anthropic PBC 2026.
+
+Copyright Anthropic PBC 2026. Permission is granted to modify and use, but not
+to publish or redistribute your solutions so it's hard to find spoilers.
+
+# Task
+
+- Optimize the kernel (in KernelBuilder.build_kernel) as much as possible in the
+  available time, as measured by test_kernel_cycles on a frozen separate copy
+  of the simulator.
+
+Validate your results using `python tests/submission_tests.py` without modifying
+anything in the tests/ folder.
+
+We recommend you look through problem.py next.
 """
 
 from collections import defaultdict
@@ -8,24 +21,34 @@ import random
 import unittest
 
 from problem import (
-    Engine, DebugInfo, SLOT_LIMITS, VLEN, N_CORES, SCRATCH_SIZE,
-    Machine, Tree, Input, HASH_STAGES, reference_kernel, build_mem_image, reference_kernel2,
+    Engine,
+    DebugInfo,
+    SLOT_LIMITS,
+    VLEN,
+    N_CORES,
+    SCRATCH_SIZE,
+    Machine,
+    Tree,
+    Input,
+    HASH_STAGES,
+    reference_kernel,
+    build_mem_image,
+    reference_kernel2,
 )
 
-
 class KernelBuilder:
-    def __init__(self, enable_debug: bool = False):
+    def __init__(self):
         self.instrs = []
         self.scratch = {}
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
-        self.enable_debug = enable_debug
+        self.enable_debug = False
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots, vliw=False):
+    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
         if not self.enable_debug:
             slots = [slot for slot in slots if slot[0] != "debug"]
         if not vliw:
@@ -106,7 +129,6 @@ class KernelBuilder:
         return self.const_map[val]
 
     def build_kernel_pipelined(self, forest_height, n_nodes, batch_size, rounds):
-        batch_group = 6
         tmp1 = self.alloc_scratch("tmp1")
         
         # Allocate header variables
@@ -121,9 +143,6 @@ class KernelBuilder:
         ]
         for v in header_vars:
             self.alloc_scratch(v, 1)
-        
-        # FIX: Use deferred building with separate temp registers to enable VLIW packing
-        # Instead of reusing tmp1 (which creates dependencies), use separate temps
         header_body = []
         header_temps = [self.alloc_scratch(f"tmp_h{i}") for i in range(len(header_vars))]
         
@@ -191,7 +210,7 @@ class KernelBuilder:
 
         v_hash_consts = []
         hash_const_addrs = []
-        v_hash_multipliers = []  # For fusable stages: multiplier = 1 + 2^shift
+        v_hash_multipliers = []
         hash_fusable = []  # Track which stages can be fused
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             # Check if stage is fusable: (a + c1) + (a << c3) = a * (1 + 2^c3) + c1
@@ -203,7 +222,6 @@ class KernelBuilder:
             init_body.append(("valu", ("vbroadcast", v_val1, c1_addr)))
             
             if fusable:
-                # For fusable stages, use multiplier vector instead of shift vector
                 multiplier = 1 + (1 << val3)
                 v_mult = self.alloc_scratch(f"v_hash_mult_{hi}", VLEN)
                 mult_addr = self.scratch_const_deferred(multiplier, init_body)
@@ -367,7 +385,6 @@ class KernelBuilder:
                 addr_ready.extend(addr_inflight)
                 addr_inflight.clear()
 
-        # State machine: 0=XOR, 1..18=hash (3 ops/stage), 19=idx&1, 20=idx_add, 21=idx_mul, 22=wrap_lt, 23=wrap_mul, 24=done
         def get_op(state, v_val, v_idx, v_node, tmpA, tmpB, idx_mode, wrap):
             if state == 0:
                 return ("^", v_val, v_val, v_node), 1
